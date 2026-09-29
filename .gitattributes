@@ -1,0 +1,7 @@
+# Fins de ligne LF partout : indispensable sous Windows (les scripts .sh
+# exécutés dans les containers Linux cassent avec des CRLF).
+* text=auto eol=lf
+*.sh text eol=lf
+*.png binary
+*.jpg binary
+*.pdf binary

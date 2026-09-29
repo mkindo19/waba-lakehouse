@@ -1,0 +1,164 @@
+# WABA Group — Plateforme Lakehouse (niveau 1 : Foundation)
+# Lancement : docker compose up -d --build   (voir README)
+name: waba
+
+x-s3-env: &s3-env
+  S3_ENDPOINT: http://minio:9000
+  AWS_ACCESS_KEY_ID: ${WABA_S3_ACCESS_KEY}
+  AWS_SECRET_ACCESS_KEY: ${WABA_S3_SECRET_KEY}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  RAW_BUCKET: raw-landing
+  ARCHIVE_BUCKET: archive
+
+x-spark-common: &spark-common
+  build:
+    context: ./spark
+    args:
+      SPARK_IMAGE: ${SPARK_IMAGE}
+      ICEBERG_VERSION: ${ICEBERG_VERSION}
+  image: waba/spark:${WABA_VERSION:-dev}
+  environment:
+    <<: *s3-env
+    PII_HASH_SALT: ${PII_HASH_SALT}
+  volumes:
+    - ./spark/jobs:/opt/spark-apps        # code monté : pas besoin de rebuild à chaque modif
+  networks: [waba]
+  depends_on:
+    iceberg-rest:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- stockage objet
+  minio:
+    image: ${MINIO_IMAGE}
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # console web
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [waba]
+    restart: unless-stopped
+
+  minio-init:
+    image: ${MINIO_MC_IMAGE}
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      WABA_S3_ACCESS_KEY: ${WABA_S3_ACCESS_KEY}
+      WABA_S3_SECRET_KEY: ${WABA_S3_SECRET_KEY}
+    entrypoint: ["/bin/sh", "/init.sh"]
+    volumes:
+      - ./infra/minio/init.sh:/init.sh:ro
+    networks: [waba]
+    restart: "no"
+
+  # ---------------------------------------------------------------- catalogue Iceberg
+  iceberg-rest:
+    image: ${ICEBERG_REST_IMAGE}
+    user: "0:0"   # écriture du fichier SQLite du catalogue sur le volume (dev local uniquement)
+    environment:
+      <<: *s3-env
+      CATALOG_WAREHOUSE: s3://lakehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_URI: jdbc:sqlite:file:/catalog/iceberg_catalog.db
+    volumes:
+      - iceberg-catalog:/catalog
+    ports:
+      - "8181:8181"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8181/v1/config || wget -qO- http://localhost:8181/v1/config || bash -c 'exec 3<>/dev/tcp/127.0.0.1/8181'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [waba]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- calcul Spark
+  spark-master:
+    <<: *spark-common
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      <<: *s3-env
+      PII_HASH_SALT: ${PII_HASH_SALT}
+      SPARK_MASTER_HOST: spark-master
+    ports:
+      - "7077:7077"
+      - "8090:8080"   # UI Spark master
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8080 >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  spark-worker:
+    <<: *spark-common
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      <<: *s3-env
+      PII_HASH_SALT: ${PII_HASH_SALT}
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-4}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-6g}
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "8091:8081"   # UI Spark worker
+
+  # ---------------------------------------------------------------- SQL Trino
+  trino:
+    image: ${TRINO_IMAGE}
+    environment:
+      <<: *s3-env
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      iceberg-rest:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/lib/trino/bin/health-check"]   # script fourni par l'image officielle
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks: [waba]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- générateur Streamlit
+  generator:
+    build: ./generator
+    image: waba/generator:${WABA_VERSION:-dev}
+    environment:
+      <<: *s3-env
+    ports:
+      - "8501:8501"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    networks: [waba]
+    restart: unless-stopped
+
+volumes:
+  minio-data:
+  iceberg-catalog:
+
+networks:
+  waba:
+    name: waba
