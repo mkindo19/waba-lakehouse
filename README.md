@@ -1,4 +1,4 @@
-# WABA Group — Plateforme Analytique Financière Multi-Pays
+# WABA Group - Plateforme Analytique Financière Multi-Pays
 
 Challenge Data Engineer Artefact : un Data Lakehouse (batch + streaming) pour un groupe
 fictif de banque-assurance présent dans 8 pays d'Afrique de l'Ouest.
