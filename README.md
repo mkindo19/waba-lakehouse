@@ -21,7 +21,7 @@ fictif de banque-assurance présent dans 8 pays d'Afrique de l'Ouest.
 | `minio` | Stockage objet S3 : `raw-landing`, `lakehouse`, `archive` | http://localhost:9001 (console) |
 | `iceberg-rest` | Catalogue Iceberg (REST) partagé par Spark et Trino | http://localhost:8181 |
 | `spark-master` / `spark-worker` | Traitement PySpark | http://localhost:8090 |
-| `trino` | Requêtes SQL sur les tables Iceberg | http://localhost:8080 |
+| `trino` | Requêtes SQL sur les tables Iceberg | http://localhost:8088 (`TRINO_PORT`) |
 
 ## Prérequis
 

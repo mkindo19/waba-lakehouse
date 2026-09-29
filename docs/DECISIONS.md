@@ -46,3 +46,11 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
 
 ## D8 — Montants
 - XOF sans décimale (le franc CFA n'a pas de centimes), GHS à 2 décimales.
+
+## D9 — Disparition des images MinIO (Docker Hub)
+- **Constat** : MinIO a retiré ses images communautaires de Docker Hub (`pull access denied`).
+- **Décision** : image `coollabsio/minio:RELEASE.2025-10-15T17-29-55Z` (reconstruction de la
+  dernière release communautaire, contient `minio` et `mc`), paramétrable dans `.env`.
+- **Limite** : plus de correctifs de sécurité. En production : migrer vers un stockage S3
+  maintenu (RustFS, Garage, SeaweedFS, Ceph RGW) ou un S3 managé. Le code n'utilise que
+  l'API S3 standard (boto3, S3FileIO, s3a) : la migration ne touche que la configuration.

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from datetime import datetime, timezone
 
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
@@ -36,6 +37,23 @@ log = get_logger("ingest_raw")
 
 REJECTS_TABLE = f"{CATALOG}.raw.rejected_records"
 TS_FORMAT = "yyyy-MM-dd'T'HH:mm:ss"
+
+
+def _now_utc() -> datetime:
+    """Horodatage d'exécution figé côté driver (littéral déterministe pour MERGE)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def materialize(df: DataFrame) -> DataFrame:
+    """Fige le DataFrame (checkpoint fiable sur MinIO) avant un MERGE Iceberg.
+
+    Iceberg refuse une source MERGE contenant des expressions non déterministes
+    (input_file_name(), fenêtres...). Le checkpoint écrit les données calculées
+    dans le répertoire de checkpoint (S3) et coupe le lignage : la source du
+    MERGE devient stable, même si un executor est perdu en cours de route
+    (contrairement à localCheckpoint, stocké en mémoire des executors).
+    """
+    return df.checkpoint(eager=True)
 
 
 # ----------------------------------------------------------------------------- DDL
@@ -93,10 +111,11 @@ def write_rejects(spark: SparkSession, ds: Dataset, rejected: DataFrame) -> int:
             F.col(REASON_COL).alias("reject_reason"),
             F.sha2(F.concat_ws("|", F.col("_source_file"), F.col("raw_record")), 256).alias("record_hash"),
             F.col("raw_record"),
-            F.current_timestamp().alias("rejected_at"),
+            F.lit(_now_utc()).cast("timestamp").alias("rejected_at"),
         )
         .dropDuplicates(["record_hash"])
     )
+    out = materialize(out)
     n = out.count()
     if n:
         out.createOrReplaceTempView("staged_rejects")
@@ -115,9 +134,9 @@ def merge_valid(spark: SparkSession, ds: Dataset, valid: DataFrame) -> int:
     w = Window.partitionBy(ds.key).orderBy(F.col("_source_file").desc())
     staged = (
         valid.withColumn("_rn", F.row_number().over(w)).filter("_rn = 1").drop("_rn", CORRUPT_COL, REASON_COL)
-        .withColumn("_ingested_at", F.current_timestamp())
+        .withColumn("_ingested_at", F.lit(_now_utc()).cast("timestamp"))
     )
-    staged = protect(staged, ds.pii_columns)
+    staged = materialize(protect(staged, ds.pii_columns))
     ensure_tables(spark, ds, staged.schema)
     staged.createOrReplaceTempView("staged")
 
