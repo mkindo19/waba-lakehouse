@@ -6,4 +6,5 @@ select = ["E", "F", "W", "I", "B", "UP"]
 ignore = ["E501"]
 
 [lint.isort]
-known-first-party = ["waba_gen", "common"]
+known-first-party = ["waba_gen", "common", "waba_common"]
+known-third-party = ["airflow", "pendulum"]

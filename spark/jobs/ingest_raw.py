@@ -189,10 +189,12 @@ def ingest_dataset(spark: SparkSession, ds: Dataset, country: str | None, archiv
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Ingestion raw-landing -> Iceberg raw.*")
     parser.add_argument("--dataset", default="all", choices=["all", *DATASETS])
-    parser.add_argument("--country", default=None, help="Code ISO (ex: CI). Défaut : tous")
+    parser.add_argument("--country", default=None, help="Code ISO (ex: CI) ou ALL. Défaut : tous")
     parser.add_argument("--no-archive", dest="archive", action="store_false",
                         help="Ne pas déplacer les fichiers traités vers le bucket archive")
     args = parser.parse_args(argv)
+    if args.country and args.country.upper() == "ALL":
+        args.country = None
 
     names = INGESTION_ORDER if args.dataset == "all" else [args.dataset]
     spark = get_spark(f"ingest_raw_{args.dataset}")

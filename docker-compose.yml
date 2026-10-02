@@ -1,4 +1,4 @@
-# WABA Group — Plateforme Lakehouse (niveau 1 : Foundation)
+# WABA Group — Plateforme Lakehouse (niveaux 1 et 2 : Foundation + Orchestration)
 # Lancement : docker compose up -d --build   (voir README)
 name: waba
 
@@ -9,6 +9,42 @@ x-s3-env: &s3-env
   AWS_REGION: ${AWS_REGION:-us-east-1}
   RAW_BUCKET: raw-landing
   ARCHIVE_BUCKET: archive
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    args:
+      SPARK_IMAGE: ${SPARK_IMAGE}
+      AIRFLOW_IMAGE: ${AIRFLOW_IMAGE:-apache/airflow:2.10.5-python3.10}
+      ICEBERG_VERSION: ${ICEBERG_VERSION}
+  image: waba/airflow:${WABA_VERSION:-dev}
+  environment:
+    <<: *s3-env
+    PII_HASH_SALT: ${PII_HASH_SALT}
+    # --- Airflow : configuration par variables d'environnement (aucun secret en dur)
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: UTC
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+    # --- Connection Airflow vers le cluster Spark (format JSON, Airflow >= 2.3)
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077}'
+    # --- Variables Airflow (paramètres métier modifiables sans redéploiement)
+    AIRFLOW_VAR_WABA_GHS_PER_EUR: ${WABA_GHS_PER_EUR:-14.6}
+    # --- Spark côté Airflow (le driver tourne dans ce container)
+    SPARK_CONF_DIR: /opt/airflow/spark-conf
+    WABA_SPARK_JOBS_DIR: /opt/airflow/spark-jobs
+    WABA_SPARK_DRIVER_HOST: airflow-scheduler
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./spark/jobs:/opt/airflow/spark-jobs:ro
+    - ./spark/conf:/opt/airflow/spark-conf:ro
+    - airflow-logs:/opt/airflow/logs
+  user: "50000:0"
+  networks: [waba]
 
 x-spark-common: &spark-common
   build:
@@ -159,9 +195,84 @@ services:
     networks: [waba]
     restart: unless-stopped
 
+  # ---------------------------------------------------------------- orchestration Airflow (niveau 2)
+  airflow-db:
+    image: ${AIRFLOW_DB_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [waba]
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    # Idempotent : migration de la base, compte admin, pool Spark
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create --role Admin --username "$${AIRFLOW_ADMIN_USER}" --password "$${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname WABA --lastname Admin --email admin@waba.local || true
+        airflow pools set spark_pool 1 "Un seul job Spark a la fois (ressources du worker)"
+        echo "Airflow initialise"
+    environment:
+      <<: *s3-env
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "${AIRFLOW_PORT:-8082}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    hostname: airflow-scheduler          # nom DNS utilisé par les executors Spark pour joindre le driver
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 30s
+      retries: 10
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   minio-data:
   iceberg-catalog:
+  airflow-db-data:
+  airflow-logs:
 
 networks:
   waba:

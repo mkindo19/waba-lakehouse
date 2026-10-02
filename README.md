@@ -3,7 +3,7 @@
 Challenge Data Engineer Artefact : un Data Lakehouse (batch + streaming) pour un groupe
 fictif de banque-assurance présent dans 8 pays d'Afrique de l'Ouest.
 
-> **Avancement** : Niveau 1 (Foundation) ✅ en cours de validation · Niveaux 2 à 4 : à venir
+> **Avancement** : Niveau 1 ✅ validé · Niveau 2 ✅ validé (Airflow + médaillon, backfill par pays) · Niveaux 3-4 : à venir
 > (voir [docs/PLAN_7_JOURS.md](docs/PLAN_7_JOURS.md)).
 
 ## Architecture — Niveau 1
@@ -22,6 +22,32 @@ fictif de banque-assurance présent dans 8 pays d'Afrique de l'Ouest.
 | `iceberg-rest` | Catalogue Iceberg (REST) partagé par Spark et Trino | http://localhost:8181 |
 | `spark-master` / `spark-worker` | Traitement PySpark | http://localhost:8090 |
 | `trino` | Requêtes SQL sur les tables Iceberg | http://localhost:8088 (`TRINO_PORT`) |
+
+## Niveau 2 — Orchestration et architecture médaillon
+
+```
+raw-landing ─► raw.* ─► bronze.* ─► silver.* ─► gold.* (7 KPIs) ─► gold.regulatory_daily_report (J+1)
+   └──────────── dag_ingest_raw ───┘   dag_bronze_to_silver   dag_silver_to_gold   dag_regulatory_report
+```
+
+| Couche | Contenu | Partitionnement |
+|---|---|---|
+| `bronze.*` | copie validée de raw, sans transformation métier | pays + date d'ingestion |
+| `silver.*` | dédoublonné, joint aux référentiels, montants en EUR, nulls normalisés, aberrants signalés | pays + mois |
+| `gold.*` | 7 KPIs + rapport réglementaire | pays (+ date de rapport) |
+
+| DAG | Déclenchement | Rôle |
+|---|---|---|
+| `dag_ingest_raw` | toutes les 10 min (si nouveaux fichiers) | landing → raw → bronze |
+| `dag_bronze_to_silver` | après `dag_ingest_raw` | référentiels puis 4 flux en Silver |
+| `dag_silver_to_gold` | après `dag_bronze_to_silver` | 7 tables Gold |
+| `dag_regulatory_report` | chaque jour 00h30 UTC | agrégats BCEAO/CIMA de J-1 + export CSV |
+
+Interface Airflow : http://localhost:8082 (identifiants `AIRFLOW_ADMIN_*` dans `.env`).
+Backfill d'un pays : *Trigger DAG w/ config* → `{"country_code": "SN"}`.
+Exécution manuelle sans Airflow : `make bronze`, `make silver`, `make gold`, `make report DATE=2026-06-30`.
+Contrôles : `docker compose exec -T trino trino --catalog iceberg < sql/level2_checks.sql`
+(backfill : `sql/level2_backfill_check.sql`, à lancer avant et après).
 
 ## Prérequis
 
