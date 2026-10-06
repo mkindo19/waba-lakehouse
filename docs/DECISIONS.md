@@ -116,3 +116,77 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
 - Silver/Gold réécrivent uniquement les partitions du pays (`overwritePartitions`, partitionnement par pays) :
   un backfill SN ne touche ni les données ni les snapshots des autres pays. Contrôle :
   `sql/level2_backfill_check.sql` (volumes identiques avant/après, partitions réécrites = SN uniquement).
+
+## D18 — Kafka (niveau 3) : KRaft, topics explicites, profil "streaming"
+- **Kafka 3.9 en mode KRaft** (un nœud broker + contrôleur, sans Zookeeper) : l'énoncé autorise les deux ;
+  Zookeeper est déprécié et supprimé dans Kafka 4. Facteur de réplication 1 (un seul broker en local) ;
+  en production : 3 brokers minimum, réplication 3, `min.insync.replicas=2`.
+- **Topics créés explicitement** par `kafka-init` (`infra/kafka/create-topics.sh`, idempotent) et
+  `auto.create.topics.enable=false` : une faute de frappe dans un nom de topic produit une erreur au lieu d'un
+  topic fantôme.
+- **3 partitions par topic, clé = `country_code`** : ordre garanti par pays, parallélisme de lecture.
+- **Rétention** : 7 jours pour `raw-*` / `silver-*` (rejouables), 30 jours pour les alertes `gold-*` et la DLQ
+  (temps d'investigation).
+- **Profil Docker Compose `streaming`** : Kafka, Kafka UI (et NiFi ensuite) ne démarrent qu'avec
+  `make up-streaming`, pour ne pas consommer de mémoire quand on ne travaille que sur le batch.
+- **Kafka UI sans authentification** : acceptable en local uniquement (port publié sur le poste) ; au niveau 4,
+  accès derrière Keycloak.
+
+## D19 — NiFi : flux « as code » (raw-landing -> Kafka)
+- **NiFi 1.28** (dernière 1.x) plutôt que 2.x : HTTP possible en local sans gestion de certificats, et
+  processeurs Kafka 2.6 / S3 inclus dans l'image. Migration 2.x (HTTPS + authentification) au niveau 4.
+- **Le flux est un script versionné** (`infra/nifi/deploy_flow.py`, API REST, bibliothèque standard) exécuté
+  par le container `nifi-init` : rejouable, relu en revue de code, identique sur tous les postes. L'interface
+  NiFi sert à observer (files, provenance), pas à construire.
+- **Chaîne** : ListS3 (toutes les 10 s, état mémorisé : chaque fichier émis une fois) -> UpdateAttribute
+  (topic cible déduit du dossier : `bank_transactions/` -> `raw-bank-transactions`) -> RouteOnAttribute
+  (seuls les 4 flux financiers ; les référentiels restent au batch) -> FetchS3Object -> UpdateRecord
+  (CSV -> JSON + `ingestion_timestamp` + `source_file`) -> PublishKafkaRecord (1 ligne = 1 message).
+- **Colonnes lues en texte** (« Use String Fields From Header ») : NiFi ne devine aucun type ; le typage et la
+  validation sont faits par Spark Streaming (job 1), comme en batch. Un montant `12a` traverse NiFi et sera
+  rejeté vers la DLQ par Spark.
+- **Clé Kafka = `country_code`**, `acks=all` (accusé de réception du broker avant de considérer l'envoi réussi).
+- **Back-pressure** : 10 000 FlowFiles / 500 Mo par file, 2 000 / 100 Mo avant Kafka. Si Kafka ralentit, la
+  file se remplit puis NiFi arrête d'alimenter l'étape précédente (les fichiers restent dans MinIO).
+- **Erreurs** : fichier introuvable ou CSV illisible -> topic `dlq-financial-events` (avec le nom du fichier en
+  en-tête) ; échec d'envoi Kafka -> nouvelle tentative après pénalité de 30 s.
+
+## D20 — Lecture concurrente de raw-landing (NiFi + batch)
+- NiFi (temps réel) et Spark batch (toutes les 10 min) lisent le même bucket ; le batch **archive** ensuite.
+- **Risque** : archiver un fichier que NiFi n'a pas encore téléchargé. **Parade** : le batch n'archive qu'un
+  fichier déposé depuis plus de `ARCHIVE_MIN_AGE_SECONDS` (120 s par défaut, `common/landing.py`) ; les plus
+  récents sont archivés au passage suivant (déjà ingérés : le MERGE évite tout doublon).
+- En production : notifications d'événements S3 (bucket notification -> Kafka) plutôt qu'un listing périodique.
+
+## D21 — Job streaming 1 (raw -> silver)
+- **Tables Iceberg séparées** `silver.rt_*` : la couche batch réécrit ses partitions (`overwritePartitions`) et
+  effacerait les lignes du streaming ; deux écrivains sur une table = conflits de commit. Principe Lambda : vue
+  temps réel distincte, remplacée par la vue batch quand celle-ci passe.
+- **Mêmes règles de qualité qu'en batch** (`common/quality.py`), hors contrôles de clés étrangères (jointure
+  avec 1,3 M de lignes de référentiels à chaque micro-lot : trop coûteux pour un gain faible, le batch les vérifie).
+  Rejets -> `dlq-financial-events` avec motif et message d'origine intact.
+- **Dédoublonnage 10 min** sur l'identifiant (`dropDuplicatesWithinWatermark`), watermark sur l'**heure d'arrivée
+  Kafka** et non sur l'heure métier : le générateur simule des journées passées, toutes « en retard » au sens
+  d'un watermark métier, qui seraient donc jetées.
+- **Double sink** (`foreachBatch`) : Kafka `silver-*` (au moins une fois : un micro-lot rejoué après panne peut
+  republier ; le job 2 dédoublonne ses alertes) et Iceberg par **MERGE** sur l'identifiant (idempotent).
+- **Checkpoints** sur un volume Docker partagé driver / executors (offsets + état du dédoublonnage) ;
+  en production : stockage objet ou HDFS. Petits fichiers Iceberg (un commit par micro-lot) : compaction
+  périodique `rewrite_data_files` à planifier (perspective).
+- **Ressources** : chaque job streaming réserve 1 cœur / 1 Go (`spark.cores.max=1`) en permanence ; le worker
+  passe à 8 cœurs / 10 Go pour que les jobs batch (4 cœurs) gardent leur place.
+
+## D22 — Catalogue SQLite et écritures concurrentes ; publication Kafka « effectivement une fois »
+- **Constat (vécu)** : les 4 requêtes du job 1 committent en parallèle ; le catalogue REST, adossé à SQLite
+  (D6), refuse les écritures simultanées (`ServiceFailureException: UncheckedSQLException`). La requête échoue,
+  le container redémarre et rejoue le micro-lot : les topics `silver-*` ont reçu 17 fois les mêmes messages.
+- **Parades** : (1) verrou dans le driver, un commit Iceberg à la fois, et nouvelles tentatives avec attente
+  croissante (autres écrivains : jobs batch) ; (2) **registre des micro-lots terminés** (`_sinks_last_batch`,
+  à côté du checkpoint) : un micro-lot rejoué avec un `batch_id` déjà écrit n'est pas republié ; ordre
+  d'écriture Iceberg (idempotent) -> Kafka -> registre. Fenêtre résiduelle de doublon : panne entre l'envoi
+  Kafka et l'écriture du registre (le job 2 dédoublonne ses alertes).
+- **Cause exacte (logs du serveur `iceberg-rest`)** : `SQLITE_BUSY - database is locked`. Une fois une
+  connexion bloquée, même le batch seul échouait (`CommitStateUnknownException`) jusqu'au redémarrage du
+  catalogue. **Réglage** : SQLite en mode **WAL** (lectures et écriture simultanées) et **`busy_timeout=30000`**
+  (un écrivain attend la libération du verrou au lieu d'échouer), via l'URI JDBC du catalogue.
+- **En production** : catalogue sur PostgreSQL (Polaris / Lakekeeper) et producteur Kafka transactionnel.

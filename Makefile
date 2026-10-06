@@ -5,7 +5,7 @@ SPARK_SUBMIT := $(COMPOSE) exec -T spark-master /opt/spark/bin/spark-submit --ma
 DATASET ?= all
 COUNTRY ?=
 
-.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui
+.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset
 
 help:                ## Liste des commandes
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -66,3 +66,47 @@ test-spark:          ## Tests des transformations Spark (nécessite Java + pyspa
 
 lint:                ## Vérification PEP 8 (ruff)
 	ruff check generator spark airflow
+
+# ----------------------------------------------------------------------------- niveau 3 : streaming
+KAFKA_EXEC := $(COMPOSE) exec -T kafka /opt/kafka/bin
+
+up-streaming: env    ## [N3] Démarre la stack + Kafka, Kafka UI (profil streaming)
+	$(COMPOSE) --profile streaming up -d --build
+
+topics:              ## [N3] Liste des topics Kafka avec partitions et rétention
+	@$(KAFKA_EXEC)/kafka-topics.sh --bootstrap-server kafka:9092 --describe | grep -E "^Topic:" | awk '{print $$2, $$4, $$6, $$10}' | column -t
+
+kafka-smoke:         ## [N3] Test aller-retour : produire puis relire 1 message (topic jetable)
+	@$(KAFKA_EXEC)/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic smoke-test --partitions 1 --replication-factor 1 >/dev/null
+	@echo '{"test":"waba","ts":"'$$(date -u +%FT%TZ)'"}' | $(KAFKA_EXEC)/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic smoke-test
+	@$(KAFKA_EXEC)/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic smoke-test --from-beginning --max-messages 1 --timeout-ms 15000
+	@$(KAFKA_EXEC)/kafka-topics.sh --bootstrap-server kafka:9092 --delete --topic smoke-test && echo "OK : message produit puis relu (topic smoke-test supprimé)"
+
+nifi-deploy:         ## [N3] (Re)lance le déploiement du flux NiFi (idempotent)
+	$(COMPOSE) --profile streaming run --rm nifi-init
+
+nifi-redeploy:       ## [N3] Supprime puis recrée le flux NiFi (après modification de deploy_flow.py)
+	$(COMPOSE) --profile streaming run --rm nifi-init python -u /scripts/deploy_flow.py --recreate
+
+TOPIC ?= raw-bank-transactions
+N ?= 3
+kafka-peek:          ## [N3] Affiche N messages d'un topic (TOPIC=raw-bank-transactions N=3), avec clé
+	@$(KAFKA_EXEC)/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic $(TOPIC) --from-beginning \
+	  --max-messages $(N) --timeout-ms 15000 --property print.key=true --property key.separator=" | "
+
+stream-logs:         ## [N3] Journaux du job streaming 1 (raw -> silver), micro-lot par micro-lot
+	$(COMPOSE) --profile streaming logs -f --tail=50 stream-raw-to-silver
+
+dlq-test:            ## [N3] Publie un message volontairement invalide (montant "12a") dans raw-bank-transactions
+	@echo 'SN|{"transaction_id":"DLQ-TEST-1","timestamp":"2026-10-05T12:00:00","account_id":"X","beneficiary_account":"","branch_id":"X","country_code":"SN","transaction_type":"PAYMENT","amount":"12a","currency":"XOF","channel":"ATM","transaction_status":"SUCCESS","fee_amount":"0","entity_type":"BANK","source_file":"test-manuel","ingestion_timestamp":"2026-10-06T00:00:00.000Z"}' \
+	  | $(KAFKA_EXEC)/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic raw-bank-transactions \
+	    --property parse.key=true --property key.separator='|' && echo "message invalide publié : il doit apparaître dans dlq-financial-events"
+
+stream-reset:        ## [N3] Repart de zéro côté streaming : vide silver-* et la DLQ, efface les checkpoints du job 1
+	@read -p "Vider les topics silver-* / dlq et rejouer raw-* depuis le début ? [y/N] " ok && [ "$$ok" = "y" ] || { echo "annulé"; exit 1; }
+	$(COMPOSE) --profile streaming stop stream-raw-to-silver
+	$(KAFKA_EXEC)/kafka-topics.sh --bootstrap-server kafka:9092 --delete --topic 'silver-.*|dlq-financial-events'
+	sleep 10
+	$(COMPOSE) --profile streaming run --rm kafka-init
+	$(COMPOSE) --profile streaming run --rm --no-deps --entrypoint rm stream-raw-to-silver -rf /opt/spark-checkpoints/raw_to_silver
+	$(COMPOSE) --profile streaming up -d stream-raw-to-silver

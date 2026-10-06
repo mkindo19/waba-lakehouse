@@ -112,7 +112,9 @@ services:
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://minio:9000
       CATALOG_S3_PATH__STYLE__ACCESS: "true"
-      CATALOG_URI: jdbc:sqlite:file:/catalog/iceberg_catalog.db
+      # WAL : les lectures ne bloquent plus les écritures ; busy_timeout : un écrivain ATTEND jusqu'à 30 s
+      # que le verrou se libère au lieu d'échouer immédiatement (SQLITE_BUSY), cf. D22
+      CATALOG_URI: jdbc:sqlite:file:/catalog/iceberg_catalog.db?journal_mode=WAL&busy_timeout=30000
     volumes:
       - iceberg-catalog:/catalog
     ports:
@@ -153,8 +155,13 @@ services:
       <<: *s3-env
       PII_HASH_SALT: ${PII_HASH_SALT}
       SPARK_CONF_DIR: /opt/waba/spark-conf
-      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-4}
-      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-6g}
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-8}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-10g}
+    volumes:
+      - ./spark/jobs:/opt/spark-apps
+      - ./spark/conf:/opt/waba/spark-conf:ro
+      # Niveau 3 : l'état des requêtes de streaming (dédoublonnage, fenêtres) est écrit par les executors
+      - spark-checkpoints:/opt/spark-checkpoints
     depends_on:
       spark-master:
         condition: service_healthy
@@ -268,11 +275,181 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ================================================================ NIVEAU 3 : streaming
+  # Profil "streaming" : ces services ne démarrent qu'avec `make up-streaming`
+  # (docker compose --profile streaming up -d), pour économiser la mémoire sinon.
+
+  # ---------------------------------------------------------------- bus de messages Kafka
+  kafka:
+    image: ${KAFKA_IMAGE:-apache/kafka:3.9.0}
+    profiles: ["streaming"]
+    hostname: kafka
+    environment:
+      # Mode KRaft : un seul nœud joue broker ET contrôleur (plus de Zookeeper)
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-bxwqfjudTFGaDn0rT44cNQ}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # 3 écoutes : PLAINTEXT (containers du réseau waba), EXTERNAL (ton PC), CONTROLLER (interne KRaft)
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Un seul broker : facteur de réplication 1 pour les topics internes
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Les topics sont créés explicitement (kafka-init) : pas de topic créé par une faute de frappe
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_RETENTION_HOURS: 168          # 7 jours par défaut
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx1g"
+    ports:
+      - "${KAFKA_EXTERNAL_PORT:-9094}:9094"   # accès depuis le PC (outils locaux)
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+    networks: [waba]
+    restart: unless-stopped
+
+  kafka-init:
+    image: ${KAFKA_IMAGE:-apache/kafka:3.9.0}
+    profiles: ["streaming"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/scripts/create-topics.sh"]
+    volumes:
+      - ./infra/kafka:/scripts:ro              # dossier monté (cf. D16)
+    networks: [waba]
+    restart: "no"
+
+  kafka-ui:
+    image: ${KAFKA_UI_IMAGE:-provectuslabs/kafka-ui:v0.7.2}
+    profiles: ["streaming"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: waba
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "false"
+    ports:
+      - "${KAFKA_UI_PORT:-8085}:8080"          # 8080 déjà pris sur le poste
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks: [waba]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- collecte temps réel NiFi
+  nifi:
+    image: ${NIFI_IMAGE:-apache/nifi:1.28.1}
+    profiles: ["streaming"]
+    hostname: nifi
+    environment:
+      # HTTP sans authentification : poste local uniquement (au niveau 4 : HTTPS + Keycloak)
+      NIFI_WEB_HTTP_PORT: 8080
+      NIFI_WEB_HTTP_HOST: 0.0.0.0
+      NIFI_WEB_PROXY_HOST: "localhost:${NIFI_PORT:-8089},nifi:8080,localhost:8080"
+      # Clé de chiffrement des propriétés sensibles (secret MinIO) dans le flux NiFi
+      NIFI_SENSITIVE_PROPS_KEY: ${NIFI_SENSITIVE_PROPS_KEY}
+      NIFI_JVM_HEAP_INIT: 512m
+      NIFI_JVM_HEAP_MAX: 2g
+    ports:
+      - "${NIFI_PORT:-8089}:8080"
+    volumes:                                   # flux, état de ListS3 et files d'attente survivent aux redémarrages
+      - nifi-conf:/opt/nifi/nifi-current/conf
+      - nifi-state:/opt/nifi/nifi-current/state
+      - nifi-database:/opt/nifi/nifi-current/database_repository
+      - nifi-flowfile:/opt/nifi/nifi-current/flowfile_repository
+      - nifi-content:/opt/nifi/nifi-current/content_repository
+      - nifi-provenance:/opt/nifi/nifi-current/provenance_repository
+    healthcheck:                               # port ouvert ; deploy_flow.py attend ensuite que l'API réponde
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks: [waba]
+    restart: unless-stopped
+
+  nifi-init:
+    # Déploie le flux NiFi versionné (infra/nifi/deploy_flow.py) via l'API REST : idempotent
+    image: ${NIFI_INIT_IMAGE:-python:3.11-slim}
+    profiles: ["streaming"]
+    command: ["python", "-u", "/scripts/deploy_flow.py"]
+    environment:
+      <<: *s3-env
+      NIFI_API: http://nifi:8080/nifi-api
+      KAFKA_BOOTSTRAP: kafka:9092
+    volumes:
+      - ./infra/nifi:/scripts:ro
+    depends_on:
+      nifi:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    networks: [waba]
+    restart: "no"
+
+  # ---------------------------------------------------------------- Spark Structured Streaming
+  # Job 1 : raw-* -> silver-* (Kafka) + silver.rt_* (Iceberg). Le driver tourne dans ce container,
+  # les executors sur spark-worker (1 cœur réservé en permanence : spark.cores.max=1).
+  stream-raw-to-silver:
+    <<: *spark-common
+    profiles: ["streaming"]
+    hostname: stream-raw-to-silver
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master=spark://spark-master:7077
+      - --conf=spark.driver.host=stream-raw-to-silver
+      - --conf=spark.driver.memory=1g
+      - --conf=spark.cores.max=1
+      - --conf=spark.executor.cores=1
+      - --conf=spark.executor.memory=1g
+      - --conf=spark.sql.shuffle.partitions=4
+      - /opt/spark-apps/stream_raw_to_silver.py
+    environment:
+      <<: *s3-env
+      SPARK_CONF_DIR: /opt/waba/spark-conf
+      KAFKA_BOOTSTRAP: kafka:9092
+      WABA_GHS_PER_EUR: ${WABA_GHS_PER_EUR:-14.6}
+    volumes:
+      - ./spark/jobs:/opt/spark-apps
+      - ./spark/conf:/opt/waba/spark-conf:ro
+      - spark-checkpoints:/opt/spark-checkpoints
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped          # une requête en échec -> le container redémarre et reprend au checkpoint
+
 volumes:
+  spark-checkpoints:
   minio-data:
   iceberg-catalog:
   airflow-db-data:
   airflow-logs:
+  kafka-data:
+  nifi-conf:
+  nifi-state:
+  nifi-database:
+  nifi-flowfile:
+  nifi-content:
+  nifi-provenance:
 
 networks:
   waba:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -11,7 +12,7 @@ import numpy as np
 
 from . import config as cfg
 from .referentials import Referentials, generate_referentials
-from .storage import Sink
+from .storage import S3Sink, Sink
 from .transactions import RefIndex, generate_dataset
 from .utils import get_logger
 
@@ -27,14 +28,21 @@ def publish_referentials(sink: Sink, seed: int = 42, scale: float = 1.0) -> Refe
 
 
 def load_referentials(sink: Sink) -> Referentials:
-    """Relit les référentiels déjà publiés : les transactions ne référencent qu'eux."""
-    try:
-        frames = {name: sink.read_referential(name) for name in cfg.REFERENTIALS}
-    except Exception as exc:  # fichier absent, MinIO indisponible...
-        raise RuntimeError(
-            "Référentiels introuvables : générez d'abord customers/accounts/branches/products."
-        ) from exc
-    return Referentials(**frames)
+    """Relit les référentiels déjà publiés : les transactions ne référencent qu'eux.
+
+    Après ingestion, le batch déplace les référentiels de raw-landing vers le bucket archive :
+    on les y relit, plutôt que d'obliger à les régénérer (et à les ré-ingérer, 1,3 M de lignes).
+    """
+    sources = [sink]
+    if isinstance(sink, S3Sink):
+        sources.append(S3Sink(bucket=os.environ.get("ARCHIVE_BUCKET", "archive")))
+    for source in sources:
+        try:
+            frames = {name: source.read_referential(name) for name in cfg.REFERENTIALS}
+            return Referentials(**frames)
+        except Exception:  # fichier absent, MinIO indisponible... -> source suivante
+            continue
+    raise RuntimeError("Référentiels introuvables : générez d'abord customers/accounts/branches/products.")
 
 
 def run_one_time(
