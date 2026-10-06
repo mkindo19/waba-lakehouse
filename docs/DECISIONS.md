@@ -216,3 +216,31 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
   au lieu de la perdre. Au moins une fois ; les consommateurs dédoublonnent sur la clé.
 - **Test reproductible** : `make alert-test` publie 5 transactions horodatées maintenant (rafale + AML + liquidité),
   marquées `ALERT-TEST-*` ; R2 et R3 sont vérifiées sur les anomalies injectées par le générateur (0,5 %).
+
+## D24 — Trino : catalogue Kafka et requête Lambda unifiée
+- **Catalogue `kafka`** (`trino/catalog/kafka.properties`) : les topics deviennent des tables en lecture seule ;
+  le schéma JSON de chaque topic est décrit dans `trino/kafka/<topic>.json` (champ -> colonne typée, dates au format
+  ISO 8601). Colonnes techniques visibles (`_timestamp`, `_partition_offset`...) : elles servent à mesurer la latence.
+- **Requête de l'énoncé exécutée telle quelle** (`sql/level3_lambda.sql`, partie 1) : elle tourne sans erreur, mais
+  joint des lignes de grains différents (une transaction côté Kafka, une ligne entité x type côté gold) et additionne
+  batch et temps réel sur les mêmes jours : montants comptés plusieurs fois.
+- **Version corrigée** (partie 2) : agrégation par pays et jour des deux côtés, puis le temps réel ne couvre que les
+  jours postérieurs à la dernière date gold du pays. C'est le principe Lambda : la vue batch, exacte, remplace la vue
+  temps réel dès qu'elle passe ; pas de double comptage. Transactions de test (`ALERT-TEST-*`) exclues.
+- **Latence NiFi -> Kafka** mesurée en SQL : `_timestamp` (écriture dans Kafka) - `ingestion_timestamp` (horodatage
+  NiFi), plus au plus 10 s de détection du fichier par ListS3 (`sql/level3_checks.sql`).
+- **Limite** : le connecteur Kafka relit tout le topic à chaque requête (pas d'index) ; acceptable avec une rétention
+  de 7 jours. En production, la vue temps réel interrogée serait plutôt `silver.rt_*` (Iceberg) ou un moteur OLAP
+  temps réel (Pinot, Druid).
+
+## D25 — Conflit de commit Iceberg entre requêtes d'une même application (vécu)
+- **Constat** : `gold.rt_fraud_alerts` est alimentée par 3 requêtes du job 2 (rafales, pays inhabituel, sinistres).
+  Malgré le verrou (un commit à la fois), le job a échoué 7 fois au démarrage : `ValidationException: Found
+  conflicting files`. Le MERGE était planifié sur un **snapshot en cache** (cache de tables de Spark) alors qu'une
+  autre requête venait de commiter : Iceberg (isolation sérialisable) refuse ce commit.
+- **Conséquence** : publication Kafka avant Iceberg (D23) -> chaque échec a republié ses alertes au redémarrage :
+  109 messages pour 49 alertes « pays inhabituel ». Pas de perte, mais des doublons (même `alert_id`).
+- **Correction** : `REFRESH TABLE` juste avant chaque MERGE (sous le verrou) et `ValidationException` ajoutée aux
+  erreurs rejouables. Topics gold-* et tables gold.rt_* reconstruits (`make stream2-reset`).
+- **Leçon** : les consommateurs de `gold-*` doivent dédoublonner sur la clé du message ; en production, producteur
+  Kafka transactionnel ou topic compacté sur `alert_id`.

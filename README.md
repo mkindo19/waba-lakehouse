@@ -3,7 +3,7 @@
 Challenge Data Engineer Artefact : un Data Lakehouse (batch + streaming) pour un groupe
 fictif de banque-assurance présent dans 8 pays d'Afrique de l'Ouest.
 
-> **Avancement** : Niveau 1 ✅ validé · Niveau 2 ✅ validé (Airflow + médaillon, backfill par pays) · Niveaux 3-4 : à venir
+> **Avancement** : Niveau 1 ✅ validé · Niveau 2 ✅ validé (Airflow + médaillon, backfill par pays) · Niveau 3 ✅ streaming (NiFi, Kafka, Spark Streaming, Lambda) · Niveau 4 : à venir
 > (voir [docs/PLAN_7_JOURS.md](docs/PLAN_7_JOURS.md)).
 
 ## Architecture — Niveau 1
@@ -48,6 +48,39 @@ Backfill d'un pays : *Trigger DAG w/ config* → `{"country_code": "SN"}`.
 Exécution manuelle sans Airflow : `make bronze`, `make silver`, `make gold`, `make report DATE=2026-06-30`.
 Contrôles : `docker compose exec -T trino trino --catalog iceberg < sql/level2_checks.sql`
 (backfill : `sql/level2_backfill_check.sql`, à lancer avant et après).
+
+## Niveau 3 — Streaming temps réel et architecture Lambda
+
+```
+MinIO raw-landing ─► NiFi ─► raw-* ─► Job 1 (Spark) ─┬─► silver-* (Kafka) ─► Job 2 (Spark) ─┬─► gold-fraud-alerts
+  (ListS3 10 s)   1 ligne CSV           validation,   │   + silver.rt_* (Iceberg)  fenêtres    ├─► gold-aml-events
+                  = 1 message JSON      dédoublonnage └─► dlq-financial-events     5 min/1 min └─► gold-liquidity-alerts
+                                        10 min, EUR                                 (+ gold.rt_* Iceberg)
+Trino : iceberg.gold.* (batch) ⨝ kafka.default."silver-bank-transactions" (temps réel) = requête Lambda
+```
+
+| Élément | Fichiers | Points clés |
+|---|---|---|
+| Kafka 3.9 (KRaft) + Kafka UI | `infra/kafka/create-topics.sh` | 11 topics créés par script, 3 partitions, clé = pays |
+| NiFi 1.28 | `infra/nifi/deploy_flow.py` | flux « as code » via l'API REST, back-pressure, erreurs -> DLQ |
+| Job 1 raw -> silver | `spark/jobs/stream_raw_to_silver.py`, `common/streaming.py` | règles qualité du batch, DLQ, dédoublonnage 10 min, double sink |
+| Job 2 silver -> gold | `spark/jobs/stream_fraud_aml.py`, `common/fraud.py` | 3 règles de fraude, AML, liquidité ; une rafale = une alerte |
+| Requête Lambda | `trino/catalog/kafka.properties`, `trino/kafka/*.json`, `sql/level3_lambda.sql` | énoncé + version sans double comptage |
+
+Démarrage et tests :
+
+```bash
+make up-streaming          # stack + Kafka, Kafka UI (http://localhost:8085), NiFi (http://localhost:8089/nifi), jobs streaming
+make nifi-deploy           # déploie le flux NiFi
+docker compose exec generator python -m waba_gen stream --rows-per-tick 2000 --duration 90   # flux continu
+make dlq-test              # message invalide -> dlq-financial-events
+make alert-test            # rafale + AML + liquidité horodatées maintenant
+make gold-peek             # nombre de messages gold-*
+make lambda                # requête Lambda unifiée (Trino)
+make check3                # latence NiFi -> Kafka, double sink, DLQ, alertes, vérité terrain
+```
+
+Journaux : `make stream-logs` (job 1), `make stream2-logs` (job 2). Décisions : D18 à D24.
 
 ## Prérequis
 

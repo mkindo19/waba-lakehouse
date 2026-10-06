@@ -175,6 +175,7 @@ services:
       <<: *s3-env
     volumes:
       - ./trino/catalog:/etc/trino/catalog:ro
+      - ./trino/kafka:/etc/trino/kafka:ro      # description des topics Kafka (niveau 3)
     ports:
       - "${TRINO_PORT:-8088}:8080"   # 8080 souvent déjà pris sur le poste (Airflow, Tomcat...)
     depends_on:

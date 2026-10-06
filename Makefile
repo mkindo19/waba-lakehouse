@@ -5,7 +5,7 @@ SPARK_SUBMIT := $(COMPOSE) exec -T spark-master /opt/spark/bin/spark-submit --ma
 DATASET ?= all
 COUNTRY ?=
 
-.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset
+.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3
 
 help:                ## Liste des commandes
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -133,3 +133,9 @@ stream2-reset:       ## [N3] Repart de zéro côté job 2 : vide gold-*, efface 
 	$(COMPOSE) --profile streaming run --rm kafka-init
 	$(COMPOSE) --profile streaming run --rm --no-deps --entrypoint rm stream-fraud-aml -rf /opt/spark-checkpoints/fraud_aml
 	$(COMPOSE) --profile streaming up -d stream-fraud-aml
+
+lambda:              ## [N3] Requête Lambda unifiée : gold Iceberg (batch) + Kafka (temps réel) dans Trino
+	$(COMPOSE) exec -T trino trino --catalog iceberg < sql/level3_lambda.sql
+
+check3:              ## [N3] Contrôles du niveau 3 (latence, double sink, DLQ, alertes, AML, liquidité)
+	$(COMPOSE) exec -T trino trino --catalog iceberg < sql/level3_checks.sql

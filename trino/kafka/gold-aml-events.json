@@ -1,0 +1,72 @@
+{
+  "tableName": "gold-aml-events",
+  "schemaName": "default",
+  "topicName": "gold-aml-events",
+  "message": {
+    "dataFormat": "json",
+    "fields": [
+      {
+        "name": "event_id",
+        "mapping": "event_id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "country_code",
+        "mapping": "country_code",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "account_id",
+        "mapping": "account_id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "transaction_type",
+        "mapping": "transaction_type",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "amount",
+        "mapping": "amount",
+        "type": "DOUBLE"
+      },
+      {
+        "name": "currency",
+        "mapping": "currency",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "amount_eur",
+        "mapping": "amount_eur",
+        "type": "DOUBLE"
+      },
+      {
+        "name": "threshold_local",
+        "mapping": "threshold_local",
+        "type": "DOUBLE"
+      },
+      {
+        "name": "regulator",
+        "mapping": "regulator",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "declaration_type",
+        "mapping": "declaration_type",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "event_time",
+        "mapping": "event_time",
+        "type": "TIMESTAMP",
+        "dataFormat": "iso8601"
+      },
+      {
+        "name": "detected_at",
+        "mapping": "detected_at",
+        "type": "TIMESTAMP",
+        "dataFormat": "iso8601"
+      }
+    ]
+  }
+}

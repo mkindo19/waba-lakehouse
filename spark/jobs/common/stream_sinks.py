@@ -27,7 +27,10 @@ CHECKPOINT_ROOT = os.environ.get("STREAM_CHECKPOINT_DIR", "file:///opt/spark-che
 # Les requêtes d'une application appellent foreachBatch dans des threads parallèles du driver. Le
 # catalogue Iceberg (REST + SQLite, D6) n'accepte qu'une écriture à la fois : on sérialise les commits.
 _CATALOG_LOCK = threading.Lock()
-_RETRYABLE = ("ServiceFailureException", "CommitFailedException", "database is locked", "SQLITE_BUSY")
+# ValidationException : une autre requête de l'application a commité dans la même table entre la lecture
+# du snapshot et le commit du MERGE (ex. gold.rt_fraud_alerts, alimentée par 3 requêtes) -> on relit et on rejoue.
+_RETRYABLE = ("ServiceFailureException", "CommitFailedException", "ValidationException", "database is locked",
+              "SQLITE_BUSY")
 
 
 def write_kafka(df: DataFrame, topic: str) -> None:
@@ -43,18 +46,20 @@ def merge_iceberg(spark: SparkSession, df: DataFrame, table: str, key: str,
                   comment: str = "", attempts: int = 6) -> None:
     """MERGE sur `key` : insère les lignes absentes (et remplace les présentes si upsert).
 
-    Rejouer le même MERGE ne crée aucun doublon. Un commit à la fois (verrou), nouvelles tentatives
-    avec attente croissante (2, 4, 8... s) si un autre écrivain occupe le catalogue.
+    Rejouer le même MERGE ne crée aucun doublon. Un commit à la fois (verrou), table relue juste avant
+    (REFRESH : le cache Spark peut garder un snapshot périmé), nouvelles tentatives avec attente
+    croissante (2, 4, 8... s) si un autre écrivain occupe le catalogue ou a commité entre-temps.
     """
     partition_cols = list(partition_cols)
     view = f"_src_{table.replace('.', '_')}"
-    df.createOrReplaceTempView(view)
     action = "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *" if upsert \
         else "WHEN NOT MATCHED THEN INSERT *"
     for attempt in range(1, attempts + 1):
         try:
             with _CATALOG_LOCK:
+                df.createOrReplaceTempView(view)       # sous le verrou : vue propre à ce MERGE
                 ensure_table(spark, table, df.schema, partition_cols, comment=comment)
+                spark.sql(f"REFRESH TABLE {table}")      # dernier snapshot, pas la version en cache
                 spark.sql(f"MERGE INTO {table} t USING {view} s ON t.`{key}` = s.`{key}` {action}")
             return
         except Exception as exc:

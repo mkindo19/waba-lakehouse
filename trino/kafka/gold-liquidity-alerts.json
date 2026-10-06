@@ -1,0 +1,83 @@
+{
+  "tableName": "gold-liquidity-alerts",
+  "schemaName": "default",
+  "topicName": "gold-liquidity-alerts",
+  "message": {
+    "dataFormat": "json",
+    "fields": [
+      {
+        "name": "alert_id",
+        "mapping": "alert_id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "country_code",
+        "mapping": "country_code",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "period_start",
+        "mapping": "period_start",
+        "type": "TIMESTAMP",
+        "dataFormat": "iso8601"
+      },
+      {
+        "name": "period_end",
+        "mapping": "period_end",
+        "type": "TIMESTAMP",
+        "dataFormat": "iso8601"
+      },
+      {
+        "name": "inflow_eur",
+        "mapping": "inflow_eur",
+        "type": "DOUBLE"
+      },
+      {
+        "name": "outflow_eur",
+        "mapping": "outflow_eur",
+        "type": "DOUBLE"
+      },
+      {
+        "name": "net_outflow_eur",
+        "mapping": "net_outflow_eur",
+        "type": "DOUBLE"
+      },
+      {
+        "name": "reference_liquidity_eur",
+        "mapping": "reference_liquidity_eur",
+        "type": "DOUBLE"
+      },
+      {
+        "name": "coverage_ratio",
+        "mapping": "coverage_ratio",
+        "type": "DOUBLE"
+      },
+      {
+        "name": "min_coverage",
+        "mapping": "min_coverage",
+        "type": "DOUBLE"
+      },
+      {
+        "name": "severity",
+        "mapping": "severity",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "regulator",
+        "mapping": "regulator",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "alert_status",
+        "mapping": "alert_status",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "detected_at",
+        "mapping": "detected_at",
+        "type": "TIMESTAMP",
+        "dataFormat": "iso8601"
+      }
+    ]
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "tableName": "gold-fraud-alerts",
+  "schemaName": "default",
+  "topicName": "gold-fraud-alerts",
+  "message": {
+    "dataFormat": "json",
+    "fields": [
+      {
+        "name": "alert_id",
+        "mapping": "alert_id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "rule",
+        "mapping": "rule",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "severity",
+        "mapping": "severity",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "country_code",
+        "mapping": "country_code",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "entity_type",
+        "mapping": "entity_type",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "entity_id",
+        "mapping": "entity_id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "first_event_time",
+        "mapping": "first_event_time",
+        "type": "TIMESTAMP",
+        "dataFormat": "iso8601"
+      },
+      {
+        "name": "last_event_time",
+        "mapping": "last_event_time",
+        "type": "TIMESTAMP",
+        "dataFormat": "iso8601"
+      },
+      {
+        "name": "event_count",
+        "mapping": "event_count",
+        "type": "BIGINT"
+      },
+      {
+        "name": "amount_eur",
+        "mapping": "amount_eur",
+        "type": "DOUBLE"
+      },
+      {
+        "name": "details",
+        "mapping": "details",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "alert_status",
+        "mapping": "alert_status",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "detected_at",
+        "mapping": "detected_at",
+        "type": "TIMESTAMP",
+        "dataFormat": "iso8601"
+      }
+    ]
+  }
+}
