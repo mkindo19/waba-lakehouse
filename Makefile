@@ -5,7 +5,7 @@ SPARK_SUBMIT := $(COMPOSE) exec -T spark-master /opt/spark/bin/spark-submit --ma
 DATASET ?= all
 COUNTRY ?=
 
-.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset
+.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset
 
 help:                ## Liste des commandes
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -110,3 +110,26 @@ stream-reset:        ## [N3] Repart de zéro côté streaming : vide silver-* et
 	$(COMPOSE) --profile streaming run --rm kafka-init
 	$(COMPOSE) --profile streaming run --rm --no-deps --entrypoint rm stream-raw-to-silver -rf /opt/spark-checkpoints/raw_to_silver
 	$(COMPOSE) --profile streaming up -d stream-raw-to-silver
+
+stream2-logs:        ## [N3] Journaux du job streaming 2 (silver -> gold : fraude, AML, liquidité)
+	$(COMPOSE) --profile streaming logs -f --tail=50 stream-fraud-aml
+
+alert-test:          ## [N3] Publie 5 transactions de test (rafale, AML, liquidité) horodatées maintenant (COUNTRY=SN)
+	@bash scripts/alert_test.sh $(or $(COUNTRY),SN)
+
+gold-peek:           ## [N3] Nombre de messages dans les topics gold-* (contenu : make kafka-peek TOPIC=gold-fraud-alerts)
+	@for t in gold-fraud-alerts gold-aml-events gold-liquidity-alerts; do \
+	  n=$$($(KAFKA_EXEC)/kafka-get-offsets.sh --bootstrap-server kafka:9092 --topic $$t | awk -F: '{s+=$$3} END {print s+0}'); \
+	  echo "== $$t : $$n message(s)"; \
+	done
+
+stream2-reset:       ## [N3] Repart de zéro côté job 2 : vide gold-*, efface ses checkpoints et les tables gold.rt_*
+	@read -p "Vider les topics gold-*, les tables gold.rt_* et rejouer silver-* depuis le début ? [y/N] " ok && [ "$$ok" = "y" ] || { echo "annulé"; exit 1; }
+	$(COMPOSE) --profile streaming stop stream-fraud-aml
+	$(KAFKA_EXEC)/kafka-topics.sh --bootstrap-server kafka:9092 --delete --topic 'gold-.*'
+	for t in rt_fraud_alerts rt_aml_events rt_liquidity_alerts; do \
+	  $(COMPOSE) exec -T trino trino --execute "DROP TABLE IF EXISTS iceberg.gold.$$t"; done
+	sleep 10
+	$(COMPOSE) --profile streaming run --rm kafka-init
+	$(COMPOSE) --profile streaming run --rm --no-deps --entrypoint rm stream-fraud-aml -rf /opt/spark-checkpoints/fraud_aml
+	$(COMPOSE) --profile streaming up -d stream-fraud-aml

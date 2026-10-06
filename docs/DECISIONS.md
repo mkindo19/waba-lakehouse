@@ -190,3 +190,29 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
   catalogue. **Réglage** : SQLite en mode **WAL** (lectures et écriture simultanées) et **`busy_timeout=30000`**
   (un écrivain attend la libération du verrou au lieu d'échouer), via l'URI JDBC du catalogue.
 - **En production** : catalogue sur PostgreSQL (Polaris / Lakekeeper) et producteur Kafka transactionnel.
+
+## D23 — Job streaming 2 (silver -> gold : fraude, AML, liquidité)
+- **5 requêtes** dans une application (1 cœur / 1 Go) : `bursts` et `liquidity` (agrégats sur fenêtres glissantes
+  5 min / pas 1 min, avec état), `aml`, `unusual_country`, `claims` (sans état, événement par événement).
+  Code des règles dans `common/fraud.py` (fonctions pures, testées), le job ne fait qu'assembler.
+- **Heure métier** (`event_time`) pour les fenêtres, watermark **2 jours** (`STREAM_EVENT_WATERMARK`) : une rafale
+  s'apprécie sur l'heure des opérations, pas sur l'heure d'arrivée. Le générateur horodate ses lots sur toute la
+  journée en cours ; un lot rejoué de plus de 2 jours est ignoré par ces deux règles (le batch le couvre).
+- **Une rafale = une alerte** : une rafale tombe dans jusqu'à 5 fenêtres glissantes. Les fenêtres d'un même compte
+  qui se recoupent sont fusionnées (« îlots »), puis rattachées à l'alerte déjà émise si les périodes se
+  chevauchent : l'alerte est **mise à jour** (`alert_status = UPDATED`, plus de transactions), pas dupliquée.
+- **Seuils** : rafale = au moins 2 transactions réussies > 500 000 XOF (équivalent EUR pour le Ghana) ; sinistre >
+  3 x prime annuelle, prime annuelle = 12 x solde du compte `INSURANCE_POLICY` (prime mensuelle dans le
+  générateur) ; AML = virement réussi > 1 000 000 XOF / 5 000 GHS (indicateur posé par le job 1).
+- **Liquidité** (l'énoncé laisse la mesure ouverte) : dépôts de référence par pays = somme des soldes des comptes
+  courants, épargne et wallets actifs (`silver.accounts`) ; taux de couverture = (dépôts - sorties nettes de la
+  fenêtre) / dépôts ; alerte sous **98 %** (`LIQUIDITY_MIN_COVERAGE`), critique sous 90 %. Sorties nettes =
+  retraits, virements, paiements - dépôts, opérations réussies. Hypothèse de démonstration, à calibrer avec la
+  trésorerie (ratio de liquidité BCEAO sur données réelles).
+- **Référentiels** (clients, comptes) lus dans Iceberg `silver.*` et gardés en cache 10 min (jointure
+  stream-static) : un nouveau client est pris en compte au plus tard 10 min après le batch silver.
+- **Publication** : seules les alertes nouvelles ou aggravées sont publiées (comparaison avec `gold.rt_*`). Ordre :
+  **Kafka puis MERGE Iceberg** : une panne entre les deux republie la même alerte (même `alert_id`, clé du message)
+  au lieu de la perdre. Au moins une fois ; les consommateurs dédoublonnent sur la clé.
+- **Test reproductible** : `make alert-test` publie 5 transactions horodatées maintenant (rafale + AML + liquidité),
+  marquées `ALERT-TEST-*` ; R2 et R3 sont vérifiées sur les anomalies injectées par le générateur (0,5 %).

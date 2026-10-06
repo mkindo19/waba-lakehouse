@@ -437,6 +437,41 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped          # une requête en échec -> le container redémarre et reprend au checkpoint
 
+  # Job 2 : silver-* -> gold-fraud-alerts / gold-aml-events / gold-liquidity-alerts (Kafka) + gold.rt_* (Iceberg).
+  # Même principe que le job 1 : driver dans ce container, 1 cœur / 1 Go sur spark-worker.
+  stream-fraud-aml:
+    <<: *spark-common
+    profiles: ["streaming"]
+    hostname: stream-fraud-aml
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master=spark://spark-master:7077
+      - --conf=spark.driver.host=stream-fraud-aml
+      - --conf=spark.driver.memory=1g
+      - --conf=spark.cores.max=1
+      - --conf=spark.executor.cores=1
+      - --conf=spark.executor.memory=1g
+      - --conf=spark.sql.shuffle.partitions=4
+      - /opt/spark-apps/stream_fraud_aml.py
+    environment:
+      <<: *s3-env
+      SPARK_CONF_DIR: /opt/waba/spark-conf
+      KAFKA_BOOTSTRAP: kafka:9092
+      STREAM_EVENT_WATERMARK: ${STREAM_EVENT_WATERMARK:-2 days}
+      LIQUIDITY_MIN_COVERAGE: ${LIQUIDITY_MIN_COVERAGE:-0.98}
+    volumes:
+      - ./spark/jobs:/opt/spark-apps
+      - ./spark/conf:/opt/waba/spark-conf:ro
+      - spark-checkpoints:/opt/spark-checkpoints
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
 volumes:
   spark-checkpoints:
   minio-data:

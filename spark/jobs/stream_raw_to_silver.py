@@ -24,10 +24,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import threading
-import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -36,6 +33,7 @@ from common.datasets import CATALOG
 from common.fx import DEFAULT_GHS_PER_EUR
 from common.logging_utils import get_logger
 from common.quality import REASON_COL
+from common.stream_sinks import CHECKPOINT_ROOT, KAFKA, SinkLedger, merge_iceberg, write_kafka
 from common.streaming import (
     DLQ_TOPIC,
     STREAMS,
@@ -46,86 +44,22 @@ from common.streaming import (
     to_silver,
     with_reason,
 )
-from common.tables import ensure_table
 
 log = get_logger("stream_raw_to_silver")
 
-KAFKA = os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092")
-CHECKPOINT_ROOT = os.environ.get("STREAM_CHECKPOINT_DIR", "file:///opt/spark-checkpoints")
 DEDUP_WINDOW = "10 minutes"
-
-# Les 4 requêtes appellent foreachBatch dans des threads parallèles du driver. Le catalogue Iceberg
-# (REST + SQLite, D6) n'accepte qu'une écriture à la fois : on sérialise les commits Iceberg du job
-# et on réessaie si un autre écrivain (job batch) occupe le catalogue au même moment (cf. D22).
-_CATALOG_LOCK = threading.Lock()
-_RETRYABLE = ("ServiceFailureException", "CommitFailedException", "database is locked", "SQLITE_BUSY")
+RT_COMMENT = "Silver temps réel (job streaming 1), remplacé par la couche batch"
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
-def write_kafka(df: DataFrame, topic: str) -> None:
-    (df.write.format("kafka")
-       .option("kafka.bootstrap.servers", KAFKA)
-       .option("kafka.acks", "all")
-       .option("topic", topic)
-       .save())
-
-
-def merge_iceberg(spark: SparkSession, silver: DataFrame, table: str, key: str, attempts: int = 6) -> None:
-    """Insertion idempotente (MERGE sur l'identifiant) dans la table temps réel.
-
-    Un commit à la fois (verrou) + nouvelles tentatives avec attente croissante (2, 4, 8... s).
-    Rejouer un MERGE est sans risque : les lignes déjà présentes ne sont pas réinsérées.
-    """
-    view = f"_rt_src_{table.replace('.', '_')}"
-    silver.createOrReplaceTempView(view)
-    for attempt in range(1, attempts + 1):
-        try:
-            with _CATALOG_LOCK:
-                ensure_table(spark, table, silver.schema, ["country_code", "txn_date"],
-                             comment="Silver temps réel (job streaming 1), remplacé par la couche batch")
-                spark.sql(f"MERGE INTO {table} t USING {view} s ON t.`{key}` = s.`{key}` "
-                          "WHEN NOT MATCHED THEN INSERT *")
-            return
-        except Exception as exc:
-            if attempt == attempts or not any(m in str(exc) for m in _RETRYABLE):
-                raise
-            log.warning("catalogue Iceberg occupé, nouvelle tentative",
-                        extra={"ctx": {"table": table, "attempt": attempt}})
-            time.sleep(2 ** attempt)
-
-
-class SinkLedger:
-    """Mémorise le dernier micro-lot entièrement écrit (Iceberg + Kafka), à côté du checkpoint.
-
-    Après une panne, Spark rejoue le micro-lot inachevé avec le MÊME batch_id : s'il avait déjà
-    été entièrement écrit, on ne le republie pas dans Kafka (sinon : doublons dans silver-*).
-    """
-
-    def __init__(self, dataset: str):
-        root = CHECKPOINT_ROOT.removeprefix("file://")
-        self.path = Path(root) / "raw_to_silver" / dataset / "_sinks_last_batch"
-
-    def last(self) -> int:
-        try:
-            return int(self.path.read_text().strip())
-        except (FileNotFoundError, ValueError):
-            return -1
-
-    def done(self, batch_id: int) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(str(batch_id))
-        tmp.replace(self.path)                      # remplacement atomique
-
-
 def make_batch_writer(dataset: str, ghs_per_eur: float):
     ds, spec = spec_for(dataset)
     table = f"{CATALOG}.{spec.rt_table}"
 
-    ledger = SinkLedger(dataset)
+    ledger = SinkLedger("raw_to_silver", dataset)
 
     def process(batch: DataFrame, batch_id: int) -> None:
         if batch_id <= ledger.last():
@@ -146,7 +80,7 @@ def make_batch_writer(dataset: str, ghs_per_eur: float):
         # 1) Iceberg d'abord (idempotent), 2) puis Kafka, 3) puis le registre : si une étape échoue,
         # le micro-lot est rejoué en entier ; s'il avait abouti, le registre évite de republier.
         if n_valid:
-            merge_iceberg(spark, silver, table, ds.key)
+            merge_iceberg(spark, silver, table, ds.key, comment=RT_COMMENT)
         if n_rejected:
             write_kafka(dlq_messages(rejected, ds, spec, now), DLQ_TOPIC)
         if n_valid and spec.silver_topic:
