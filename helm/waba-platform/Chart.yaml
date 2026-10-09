@@ -1,0 +1,9 @@
+apiVersion: v2
+name: waba-platform
+description: >-
+  WABA Group — plateforme lakehouse complète sur Kubernetes (niveau 4) : ingestion (NiFi, Kafka),
+  traitement (MinIO, Iceberg, Spark Operator, Airflow), restitution (Trino, Superset),
+  gouvernance (Keycloak, OpenMetadata) et supervision (Prometheus, Loki, Grafana).
+type: application
+version: 0.1.0
+appVersion: "level4"

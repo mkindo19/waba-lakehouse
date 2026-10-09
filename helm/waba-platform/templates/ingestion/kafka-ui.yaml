@@ -1,0 +1,47 @@
+{{- if .Values.kafkaUi.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "ingestion") }}
+# Interface web Kafka (topics, messages, groupes de consommateurs et leur retard).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-ui
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "kafka-ui") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "kafka-ui") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "kafka-ui") | nindent 8 }}
+    spec:
+      containers:
+        - name: kafka-ui
+          image: {{ .Values.kafkaUi.image }}
+          env:
+            - {name: KAFKA_CLUSTERS_0_NAME, value: waba}
+            - {name: KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS, value: "kafka:9092"}
+            - {name: DYNAMIC_CONFIG_ENABLED, value: "false"}
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /actuator/health, port: http}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /actuator/health, port: http}
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources: {{- toYaml .Values.kafkaUi.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-ui
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "kafka-ui") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "kafka-ui") | nindent 4 }}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+{{- end }}

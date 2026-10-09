@@ -5,7 +5,7 @@ SPARK_SUBMIT := $(COMPOSE) exec -T spark-master /opt/spark/bin/spark-submit --ma
 DATASET ?= all
 COUNTRY ?=
 
-.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3
+.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3 k8s-files k8s-secrets k8s-install k8s-status k8s-expose k8s-uninstall k8s-lint k8s-images k8s-referentials k8s-stream k8s-trino
 
 help:                ## Liste des commandes
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -139,3 +139,57 @@ lambda:              ## [N3] Requête Lambda unifiée : gold Iceberg (batch) + K
 
 check3:              ## [N3] Contrôles du niveau 3 (latence, double sink, DLQ, alertes, AML, liquidité)
 	$(COMPOSE) exec -T trino trino --catalog iceberg < sql/level3_checks.sql
+
+# ----------------------------------------------------------------------------- niveau 4 : Kubernetes
+K8S_RELEASE := waba
+K8S_NS := processing
+K8S_HTTP_PORT ?= 8090
+HELM_CHART := helm/waba-platform
+
+k8s-files:           ## [N4] Copie les scripts de infra/ dans le chart (Helm ne lit que les fichiers du chart)
+	@mkdir -p $(HELM_CHART)/files/minio $(HELM_CHART)/files/kafka $(HELM_CHART)/files/nifi $(HELM_CHART)/files/trino-kafka
+	@cp infra/minio/init.sh $(HELM_CHART)/files/minio/init.sh
+	@cp infra/kafka/create-topics.sh $(HELM_CHART)/files/kafka/create-topics.sh
+	@cp infra/nifi/deploy_flow.py $(HELM_CHART)/files/nifi/deploy_flow.py
+	@cp trino/kafka/*.json $(HELM_CHART)/files/trino-kafka/
+
+k8s-secrets: env     ## [N4] Génère helm/values-secrets.yaml depuis .env (ignoré par git)
+	@python3 scripts/k8s_values_secrets.py
+
+k8s-lint: k8s-files k8s-secrets   ## [N4] Vérifie le chart (syntaxe + rendu complet) sans rien installer
+	helm lint $(HELM_CHART) -f helm/values-secrets.yaml
+	helm template $(K8S_RELEASE) $(HELM_CHART) -n $(K8S_NS) -f helm/values-secrets.yaml | kubectl create --dry-run=client -o name -f - >/dev/null && echo "rendu OK : manifestes valides"
+
+k8s-install: k8s-files k8s-secrets   ## [N4] Installe / met à jour TOUTE la plateforme : un seul helm upgrade --install
+	helm upgrade --install $(K8S_RELEASE) $(HELM_CHART) -n $(K8S_NS) --create-namespace \
+	  -f helm/values-secrets.yaml --wait --timeout 20m
+
+LOCAL_IMAGES := waba/generator:$(or $(WABA_VERSION),dev) waba/spark:$(or $(WABA_VERSION),dev) waba/airflow:$(or $(WABA_VERSION),dev)
+k8s-images:          ## [N4] Construit les images maison (docker compose) et les charge dans minikube (~5 min)
+	$(COMPOSE) build generator spark-master airflow-scheduler
+	@for img in $(LOCAL_IMAGES); do echo "-> minikube image load $$img"; minikube image load $$img || exit 1; done
+	@minikube image ls | grep waba/
+
+k8s-referentials:    ## [N4] Génère les référentiels dans MinIO (pod generator)
+	kubectl exec -n ingestion deploy/generator -- python -m waba_gen referentials
+
+ROWS ?= 2000
+DURATION ?= 90
+k8s-stream:          ## [N4] Flux continu de transactions (ROWS par lot, DURATION secondes)
+	kubectl exec -n ingestion deploy/generator -- python -m waba_gen stream --rows-per-tick $(ROWS) --min-interval 20 --max-interval 30 --duration $(DURATION)
+
+k8s-trino:           ## [N4] Client SQL Trino dans le cluster (catalogue iceberg)
+	kubectl exec -it -n serving deploy/trino -- trino --catalog iceberg
+
+k8s-status:          ## [N4] Pods, volumes et URL de la plateforme
+	@kubectl get pods -A -l app.kubernetes.io/part-of=waba-platform -o wide
+	@echo; kubectl get pvc -A
+	@echo; kubectl get ingress -A -o custom-columns=NAMESPACE:.metadata.namespace,URL:.spec.rules[0].host
+
+k8s-expose:          ## [N4] Rend les interfaces accessibles depuis Windows : http://<ui>.localtest.me (laisser tourner)
+	@echo "Interfaces (port $(K8S_HTTP_PORT)) : kafka-ui, minio, generator, nifi/nifi, trino  ->  http://<nom>.localtest.me:$(K8S_HTTP_PORT)   (Ctrl+C pour arrêter)"
+	kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller $(K8S_HTTP_PORT):80 --address 127.0.0.1
+
+k8s-uninstall:       ## [N4] Désinstalle la plateforme (les volumes de données sont conservés)
+	@read -p "Désinstaller la release $(K8S_RELEASE) (volumes conservés) ? [y/N] " ok && [ "$$ok" = "y" ] || { echo "annulé"; exit 1; }
+	helm uninstall $(K8S_RELEASE) -n $(K8S_NS)

@@ -1,0 +1,123 @@
+{{- if .Values.nifi.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "ingestion") }}
+{{- $home := "/opt/nifi/nifi-current" }}
+# NiFi 1.28 : raw-landing (MinIO) -> topics raw-* (Kafka), 1 ligne CSV = 1 message JSON (cf. D19).
+# Un PVC unique, découpé en sous-dossiers : configuration (dont le flux), état de ListS3 et dépôts.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nifi
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "nifi") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "nifi") | nindent 4 }}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nifi
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "nifi") | nindent 4 }}
+spec:
+  serviceName: nifi
+  replicas: 1
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "nifi") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "nifi") | nindent 8 }}
+    spec:
+      securityContext:
+        fsGroup: 1000                  # utilisateur nifi de l'image
+      initContainers:
+        # Un PVC neuf est vide : on y copie la configuration par défaut de l'image (une seule fois, -n)
+        - name: seed-conf
+          image: {{ .Values.nifi.image }}
+          command: [bash, -c, "mkdir -p /data/conf && cp -rn {{ $home }}/conf/. /data/conf/"]
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      containers:
+        - name: nifi
+          image: {{ .Values.nifi.image }}
+          env:
+            - {name: NIFI_WEB_HTTP_PORT, value: "8080"}
+            - {name: NIFI_WEB_HTTP_HOST, value: "0.0.0.0"}
+            # En-têtes Host acceptés (protection DNS rebinding) : Ingress + service interne
+            - name: NIFI_WEB_PROXY_HOST
+              value: "nifi.{{ .Values.ingress.domain }}:{{ .Values.ingress.port }},nifi.{{ .Values.ingress.domain }},nifi:8080"
+            - name: NIFI_SENSITIVE_PROPS_KEY
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: NIFI_SENSITIVE_PROPS_KEY}}
+            - {name: NIFI_JVM_HEAP_INIT, value: {{ .Values.nifi.heapInit | quote }}}
+            - {name: NIFI_JVM_HEAP_MAX, value: {{ .Values.nifi.heapMax | quote }}}
+          ports:
+            - {name: http, containerPort: 8080}
+          startupProbe:                # NiFi met 1 à 3 min à démarrer
+            tcpSocket: {port: http}
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            # NiFi refuse les en-têtes Host inconnus : on se présente comme le service interne
+            httpGet: {path: /nifi-api/flow/about, port: http, httpHeaders: [{name: Host, value: "nifi:8080"}]}
+            periodSeconds: 15
+            timeoutSeconds: 10
+          livenessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 30
+            failureThreshold: 5
+          resources: {{- toYaml .Values.nifi.resources | nindent 12 }}
+          volumeMounts:
+            {{- range $d := list "conf" "state" "database_repository" "flowfile_repository" "content_repository" "provenance_repository" }}
+            - {name: data, mountPath: {{ $home }}/{{ $d }}, subPath: {{ $d }}}
+            {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.storageClass }}
+        resources: {requests: {storage: {{ .Values.nifi.storage }}}}
+---
+# Déploiement du flux versionné (infra/nifi/deploy_flow.py) via l'API REST : idempotent.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nifi-flow
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "nifi-init") | nindent 4 }}
+data:
+  deploy_flow.py: |-
+{{ .Files.Get "files/nifi/deploy_flow.py" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nifi-init
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "nifi-init") | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "10"          # après la création des topics (poids 0)
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "nifi-init") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: deploy
+          image: {{ .Values.nifi.initImage }}
+          command: [python, -u, /scripts/deploy_flow.py]
+          env:
+            {{- include "waba.s3Env" $ | nindent 12 }}
+            - {name: NIFI_API, value: "http://nifi:8080/nifi-api"}
+            - {name: KAFKA_BOOTSTRAP, value: "kafka:9092"}
+          volumeMounts:
+            - {name: scripts, mountPath: /scripts}
+      volumes:
+        - name: scripts
+          configMap: {name: nifi-flow}
+{{- end }}

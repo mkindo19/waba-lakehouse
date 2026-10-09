@@ -244,3 +244,24 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
   erreurs rejouables. Topics gold-* et tables gold.rt_* reconstruits (`make stream2-reset`).
 - **Leçon** : les consommateurs de `gold-*` doivent dédoublonner sur la clé du message ; en production, producteur
   Kafka transactionnel ou topic compacté sur `alert_id`.
+
+## D26 — Kubernetes : un chart Helm « maison », minikube, secrets hors dépôt
+- **Cluster** : minikube (pilote Docker, 8 cœurs / 18 Go, addons ingress et metrics-server), accepté par l'énoncé.
+  Docker Compose reste l'environnement des niveaux 1-3 ; on ne fait pas tourner les deux en même temps (mémoire).
+- **Un seul chart parapluie `helm/waba-platform`** : `make k8s-install` = un seul `helm upgrade --install`.
+  Les charts publics (Airflow, Superset, Trino, OpenMetadata...) installent tout dans le namespace de la release
+  et ne savent pas, pour la plupart, cibler un autre namespace : incompatible avec « un namespace par domaine ».
+  Le chart déclare donc ses propres manifestes, chacun dans son namespace (lisibles, probes et ressources
+  maîtrisées). Exception prévue : Spark Operator (CRD + webhook), installé comme dépendance dans `processing`.
+- **Namespaces** : ingestion (NiFi, Kafka), processing (MinIO, Iceberg, Spark, Airflow ; namespace de la release),
+  serving (Trino, Superset), governance (Keycloak, OpenMetadata), monitoring (Prometheus, Loki, Grafana).
+- **Secrets** : aucun dans le chart. `helm/values-secrets.yaml` est généré depuis `.env`
+  (`scripts/k8s_values_secrets.py`, droits 600, ignoré par git) ; le chart en fait un Secret `waba-secrets` par
+  namespace, limité aux clés utiles (moindre privilège), lu par `secretKeyRef`. En production : External Secrets
+  Operator + Vault (ou Sealed Secrets) pour ne jamais faire transiter de secret par le poste.
+- **Données** : PVC pour MinIO, catalogue Iceberg, Kafka (puis bases Airflow, OpenMetadata...), annotés
+  `helm.sh/resource-policy: keep` : un `helm uninstall` ne détruit pas les données.
+- **Accès aux interfaces** : Ingress NGINX + noms `*.localtest.me` (DNS public qui répond 127.0.0.1 : rien à
+  modifier dans le fichier hosts). Depuis Windows : `make k8s-expose` (port-forward du contrôleur Ingress).
+- **Initialisations** (buckets MinIO, topics Kafka) : Jobs Helm `post-install/post-upgrade`, idempotents, mêmes
+  scripts qu'en Docker Compose (copiés dans le chart par `make k8s-files`).

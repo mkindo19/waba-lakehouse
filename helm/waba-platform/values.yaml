@@ -1,0 +1,113 @@
+# =============================================================================
+# WABA platform — valeurs par défaut (niveau 4)
+# Aucun secret ici : ils viennent de helm/values-secrets.yaml, généré depuis .env (make k8s-secrets)
+# et ignoré par git. Installation : make k8s-install  (= un seul helm upgrade --install)
+# =============================================================================
+
+# Un namespace par domaine (énoncé 4.1). Le chart est installé dans « processing » (--create-namespace) ;
+# il crée les quatre autres.
+namespaces:
+  ingestion: ingestion        # NiFi, Kafka, Kafka UI, générateur
+  processing: processing      # MinIO, catalogue Iceberg, Spark Operator, Airflow
+  serving: serving            # Trino, Superset
+  governance: governance      # Keycloak, OpenMetadata
+  monitoring: monitoring      # Prometheus, Loki, Grafana
+
+# Exposition des interfaces : Ingress NGINX (addon minikube). *.localtest.me pointe vers 127.0.0.1
+# (DNS public) : aucun fichier hosts à modifier. Accès depuis Windows : make k8s-expose.
+ingress:
+  enabled: true
+  className: nginx
+  domain: localtest.me
+  port: 8090                  # port local de make k8s-expose (80 souvent pris sous Windows)
+  routes:
+    - {host: minio, component: minio, domain: processing, service: minio, port: 9001}
+    - {host: kafka-ui, component: kafkaUi, domain: ingestion, service: kafka-ui, port: 80}
+    - {host: generator, component: generator, domain: ingestion, service: generator, port: 8501}
+    - {host: nifi, component: nifi, domain: ingestion, service: nifi, port: 8080}
+    - {host: trino, component: trino, domain: serving, service: trino, port: 8080}
+
+storageClass: standard        # provisionneur minikube (hostPath)
+
+# Images construites localement (docker compose build) puis chargées dans minikube (make k8s-images).
+# pullPolicy Never : erreur explicite (ErrImageNeverPull) si l'image n'a pas été chargée.
+localImages:
+  tag: dev
+  pullPolicy: Never
+
+s3:
+  region: us-east-1
+
+# Clés du Secret « waba-secrets » créé dans chaque namespace (valeurs dans values-secrets.yaml).
+# Principe du moindre privilège : un namespace ne reçoit que les secrets dont il a besoin.
+secretKeys:
+  ingestion: [WABA_S3_ACCESS_KEY, WABA_S3_SECRET_KEY, NIFI_SENSITIVE_PROPS_KEY]
+  processing: [MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, WABA_S3_ACCESS_KEY, WABA_S3_SECRET_KEY, PII_HASH_SALT]
+  serving: [WABA_S3_ACCESS_KEY, WABA_S3_SECRET_KEY]
+  governance: []
+  monitoring: []
+
+# ----------------------------------------------------------------------------- processing
+minio:
+  enabled: true
+  image: coollabsio/minio:RELEASE.2025-10-15T17-29-55Z
+  storage: 20Gi
+  buckets: [raw-landing, lakehouse, archive]
+  resources:
+    requests: {cpu: 100m, memory: 512Mi}
+    limits: {memory: 1Gi}
+
+icebergRest:
+  enabled: true
+  image: tabulario/iceberg-rest:1.6.0
+  storage: 1Gi
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 512Mi}
+
+# ----------------------------------------------------------------------------- ingestion
+kafka:
+  enabled: true
+  image: apache/kafka:3.9.0
+  clusterId: bxwqfjudTFGaDn0rT44cNQ
+  storage: 10Gi
+  heap: "-Xms512m -Xmx1g"
+  resources:
+    requests: {cpu: 250m, memory: 1Gi}
+    limits: {memory: 1536Mi}
+
+kafkaUi:
+  enabled: true
+  image: provectuslabs/kafka-ui:v0.7.2
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+    limits: {memory: 512Mi}
+
+generator:
+  enabled: true
+  image: waba/generator
+  resources:
+    requests: {cpu: 100m, memory: 512Mi}
+    limits: {memory: 1536Mi}            # génération des référentiels (500 000 clients) en mémoire
+
+nifi:
+  enabled: true
+  image: apache/nifi:1.28.1
+  storage: 10Gi
+  heapInit: 512m
+  heapMax: 1g
+  resources:
+    requests: {cpu: 250m, memory: 1Gi}
+    limits: {memory: 1792Mi}
+  initImage: python:3.11-slim
+
+# ----------------------------------------------------------------------------- serving
+trino:
+  enabled: true
+  image: trinodb/trino:458
+  heap: 1536M
+  queryMaxMemory: 1GB
+  queryMaxMemoryPerNode: 768MB
+  resources:
+    requests: {cpu: 250m, memory: 2Gi}
+    limits: {memory: 2560Mi}

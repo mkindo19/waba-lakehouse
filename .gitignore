@@ -1,5 +1,6 @@
 # Secrets
 .env
+helm/values-secrets.yaml
 *.pem
 *.key
 

@@ -1,0 +1,34 @@
+{{- /*
+Exposition des interfaces web : une règle Ingress par interface, dans le namespace du service.
+URL : http://<host>.<domaine>  (ex. http://kafka-ui.localtest.me). Les routes sont listées dans values.yaml
+et ne sont créées que si le composant correspondant est activé.
+*/}}
+{{- if .Values.ingress.enabled }}
+{{- range $r := .Values.ingress.routes }}
+{{- if (index $.Values $r.component).enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $r.host }}
+  namespace: {{ index $.Values.namespaces $r.domain }}
+  labels:
+    {{- include "waba.labels" $ | nindent 4 }}
+  {{- with $r.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ $.Values.ingress.className }}
+  rules:
+    - host: {{ $r.host }}.{{ $.Values.ingress.domain }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $r.service }}
+                port: {number: {{ $r.port }}}
+{{- end }}
+{{- end }}
+{{- end }}

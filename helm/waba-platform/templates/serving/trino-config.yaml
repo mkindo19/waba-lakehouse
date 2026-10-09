@@ -1,0 +1,70 @@
+{{- if .Values.trino.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "serving") }}
+# Configuration de Trino (séparée du Deployment : sa somme de contrôle redémarre Trino à chaque changement)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-config
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "trino") | nindent 4 }}
+data:
+  config.properties: |
+    coordinator=true
+    node-scheduler.include-coordinator=true
+    http-server.http.port=8080
+    # Derrière l'Ingress NGINX : accepter les en-têtes X-Forwarded-* (sinon erreur 406 dans le navigateur)
+    http-server.process-forwarded=true
+    discovery.uri=http://localhost:8080
+    query.max-memory={{ .Values.trino.queryMaxMemory }}
+    query.max-memory-per-node={{ .Values.trino.queryMaxMemoryPerNode }}
+  node.properties: |
+    node.environment=waba
+    node.data-dir=/data/trino
+  log.properties: |
+    io.trino=INFO
+  jvm.config: |
+    -server
+    -Xmx{{ .Values.trino.heap }}
+    -XX:InitialRAMPercentage=50
+    -XX:+UseG1GC
+    -XX:G1HeapRegionSize=32M
+    -XX:+ExplicitGCInvokesConcurrent
+    -XX:+ExitOnOutOfMemoryError
+    -XX:-OmitStackTraceInFastThrow
+    -XX:ReservedCodeCacheSize=256M
+    -Djdk.attach.allowAttachSelf=true
+    -Djdk.nio.maxCachedBufferSize=2000000
+    -Dfile.encoding=UTF-8
+    -XX:+EnableDynamicAgentLoading
+  # Catalogue Iceberg partagé avec Spark (même catalogue REST, même bucket). Secrets : variables d'env.
+  iceberg.properties: |
+    connector.name=iceberg
+    iceberg.catalog.type=rest
+    iceberg.rest-catalog.uri=http://{{ include "waba.svc" (dict "ctx" $ "domain" "processing" "name" "iceberg-rest") }}:8181
+    iceberg.rest-catalog.warehouse=s3://lakehouse/
+    fs.native-s3.enabled=true
+    s3.endpoint={{ include "waba.s3Endpoint" $ }}
+    s3.region=${ENV:AWS_REGION}
+    s3.path-style-access=true
+    s3.aws-access-key=${ENV:AWS_ACCESS_KEY_ID}
+    s3.aws-secret-key=${ENV:AWS_SECRET_ACCESS_KEY}
+  # Catalogue Kafka : topics lus comme des tables (schéma JSON décrit dans trino-kafka-topics)
+  kafka.properties: |
+    connector.name=kafka
+    kafka.nodes={{ include "waba.svc" (dict "ctx" $ "domain" "ingestion" "name" "kafka") }}:9092
+    kafka.default-schema=default
+    kafka.table-names=raw-bank-transactions,silver-bank-transactions,dlq-financial-events,gold-fraud-alerts,gold-aml-events,gold-liquidity-alerts
+    kafka.table-description-supplier=FILE
+    kafka.table-description-dir=/etc/trino/kafka
+    kafka.hide-internal-columns=false
+---
+# Description JSON des topics Kafka : mêmes fichiers qu'en Docker Compose (trino/kafka/, copiés par make k8s-files)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-kafka-topics
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "trino") | nindent 4 }}
+data:
+{{ (.Files.Glob "files/trino-kafka/*.json").AsConfig | indent 2 }}
+{{- end }}

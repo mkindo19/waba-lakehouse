@@ -1,0 +1,16 @@
+{{- /*
+Namespaces par domaine. « processing » est le namespace de la release (créé par helm --create-namespace) :
+il n'est pas déclaré ici, sinon Helm refuserait de créer une ressource qui existe déjà.
+*/}}
+{{- range $domain, $ns := .Values.namespaces }}
+{{- if ne $ns $.Release.Namespace }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    {{- include "waba.labels" $ | nindent 4 }}
+    waba.io/domain: {{ $domain }}
+{{- end }}
+{{- end }}

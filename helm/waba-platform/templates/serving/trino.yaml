@@ -1,0 +1,75 @@
+{{- if .Values.trino.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "serving") }}
+# Trino 458 : moteur SQL unique sur Iceberg (batch) et Kafka (temps réel) — requête Lambda (cf. D24).
+# Un seul nœud (coordinateur qui exécute aussi les requêtes) : suffisant pour minikube.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trino
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "trino") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "trino") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "trino") | nindent 8 }}
+      annotations:
+        # Redémarre Trino si sa configuration change (helm upgrade)
+        checksum/config: {{ include (print $.Template.BasePath "/serving/trino-config.yaml") . | sha256sum | trunc 16 }}
+    spec:
+      containers:
+        - name: trino
+          image: {{ .Values.trino.image }}
+          env: {{- include "waba.s3Env" $ | nindent 12 }}
+          ports:
+            - {name: http, containerPort: 8080}
+          # Readiness : le coordinateur a fini de démarrer (« starting: false »), script fourni par l'image
+          readinessProbe:
+            exec: {command: [/usr/lib/trino/bin/health-check]}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: {path: /v1/info, port: http}
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 5
+          resources: {{- toYaml .Values.trino.resources | nindent 12 }}
+          volumeMounts:
+            - {name: etc, mountPath: /etc/trino}
+            - {name: data, mountPath: /data/trino}
+      volumes:
+        - name: etc
+          projected:
+            sources:
+              - configMap:
+                  name: trino-config
+                  items:
+                    - {key: config.properties, path: config.properties}
+                    - {key: node.properties, path: node.properties}
+                    - {key: log.properties, path: log.properties}
+                    - {key: jvm.config, path: jvm.config}
+                    - {key: iceberg.properties, path: catalog/iceberg.properties}
+                    - {key: kafka.properties, path: catalog/kafka.properties}
+              - configMap:
+                  name: trino-kafka-topics
+                  items:
+                    {{- range $path, $_ := .Files.Glob "files/trino-kafka/*.json" }}
+                    - {key: {{ base $path }}, path: kafka/{{ base $path }}}
+                    {{- end }}
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trino
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "trino") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "trino") | nindent 4 }}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+{{- end }}

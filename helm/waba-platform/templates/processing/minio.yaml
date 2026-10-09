@@ -1,0 +1,123 @@
+{{- if .Values.minio.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "processing") }}
+# MinIO : stockage objet S3 du lakehouse (buckets raw-landing, lakehouse, archive). Données sur PVC.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  annotations:
+    helm.sh/resource-policy: keep      # helm uninstall ne supprime pas les données
+  name: minio-data
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "minio") | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.storageClass }}
+  resources: {requests: {storage: {{ .Values.minio.storage }}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "minio") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}          # un seul pod à la fois sur le volume RWO
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "minio") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "minio") | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"            # métriques MinIO (niveau 4.4)
+        prometheus.io/port: "9000"
+        prometheus.io/path: /minio/v2/metrics/cluster
+    spec:
+      containers:
+        - name: minio
+          image: {{ .Values.minio.image }}
+          args: [server, /data, --console-address, ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: MINIO_ROOT_USER}}
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: MINIO_ROOT_PASSWORD}}
+            - name: MINIO_PROMETHEUS_AUTH_TYPE
+              value: public
+          ports:
+            - {name: s3, containerPort: 9000}
+            - {name: console, containerPort: 9001}
+          readinessProbe:
+            httpGet: {path: /minio/health/ready, port: s3}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /minio/health/live, port: s3}
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources: {{- toYaml .Values.minio.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: minio-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "minio") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "minio") | nindent 4 }}
+  ports:
+    - {name: s3, port: 9000, targetPort: s3}
+    - {name: console, port: 9001, targetPort: console}
+---
+# Initialisation idempotente (buckets + compte applicatif) après chaque install / upgrade.
+# Même script qu'en Docker Compose (infra/minio/init.sh, copié dans files/ par make k8s-files).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: minio-init
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "minio-init") | nindent 4 }}
+data:
+  init.sh: |-
+{{ .Files.Get "files/minio/init.sh" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "minio-init") | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 10                     # réessaie tant que MinIO n'est pas prêt
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "minio-init") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          image: {{ .Values.minio.image }}
+          command: [/bin/sh, /scripts/init.sh]
+          env:
+            - {name: MINIO_URL, value: "http://minio:9000"}
+            - name: MINIO_ROOT_USER
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: MINIO_ROOT_USER}}
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: MINIO_ROOT_PASSWORD}}
+            - name: WABA_S3_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: WABA_S3_ACCESS_KEY}}
+            - name: WABA_S3_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: WABA_S3_SECRET_KEY}}
+          volumeMounts:
+            - {name: scripts, mountPath: /scripts}
+      volumes:
+        - name: scripts
+          configMap: {name: minio-init}
+{{- end }}

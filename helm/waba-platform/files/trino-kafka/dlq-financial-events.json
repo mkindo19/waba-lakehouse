@@ -1,0 +1,40 @@
+{
+  "tableName": "dlq-financial-events",
+  "schemaName": "default",
+  "topicName": "dlq-financial-events",
+  "message": {
+    "dataFormat": "json",
+    "fields": [
+      {
+        "name": "source_topic",
+        "mapping": "source_topic",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "dataset",
+        "mapping": "dataset",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "reject_reason",
+        "mapping": "reject_reason",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "raw_message",
+        "mapping": "raw_message",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "source_file",
+        "mapping": "source_file",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "detected_at",
+        "mapping": "detected_at",
+        "type": "VARCHAR"
+      }
+    ]
+  }
+}

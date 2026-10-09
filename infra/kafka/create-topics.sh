@@ -6,7 +6,7 @@
 #   dlq-*    : messages malformés (Dead Letter Queue), conservés plus longtemps pour analyse
 set -euo pipefail
 
-BOOTSTRAP="kafka:9092"
+BOOTSTRAP="${KAFKA_BOOTSTRAP:-kafka:9092}"
 KT=/opt/kafka/bin/kafka-topics.sh
 PARTITIONS=3                       # 3 partitions : parallélisme, clé = country_code
 WEEK=$((7 * 24 * 3600 * 1000))     # rétention 7 jours (ms)
