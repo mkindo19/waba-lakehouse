@@ -5,7 +5,7 @@ SPARK_SUBMIT := $(COMPOSE) exec -T spark-master /opt/spark/bin/spark-submit --ma
 DATASET ?= all
 COUNTRY ?=
 
-.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3 k8s-files k8s-secrets k8s-install k8s-status k8s-expose k8s-uninstall k8s-lint k8s-images k8s-referentials k8s-stream k8s-trino
+.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3 k8s-files k8s-secrets k8s-install k8s-status k8s-expose k8s-uninstall k8s-lint k8s-images k8s-referentials k8s-stream k8s-trino k8s-deps k8s-crds k8s-spark k8s-spark-logs
 
 help:                ## Liste des commandes
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -156,11 +156,20 @@ k8s-files:           ## [N4] Copie les scripts de infra/ dans le chart (Helm ne 
 k8s-secrets: env     ## [N4] Génère helm/values-secrets.yaml depuis .env (ignoré par git)
 	@python3 scripts/k8s_values_secrets.py
 
-k8s-lint: k8s-files k8s-secrets   ## [N4] Vérifie le chart (syntaxe + rendu complet) sans rien installer
+k8s-lint: k8s-files k8s-secrets k8s-crds   ## [N4] Vérifie le chart (syntaxe + rendu complet) sans rien installer
 	helm lint $(HELM_CHART) -f helm/values-secrets.yaml
 	helm template $(K8S_RELEASE) $(HELM_CHART) -n $(K8S_NS) -f helm/values-secrets.yaml | kubectl create --dry-run=client -o name -f - >/dev/null && echo "rendu OK : manifestes valides"
 
-k8s-install: k8s-files k8s-secrets   ## [N4] Installe / met à jour TOUTE la plateforme : un seul helm upgrade --install
+k8s-deps:            ## [N4] Télécharge les dépendances du chart (Spark Operator) dans helm/waba-platform/charts/
+	@helm repo add spark-operator https://kubeflow.github.io/spark-operator >/dev/null 2>&1 || true
+	helm dependency build $(HELM_CHART) || helm dependency update $(HELM_CHART)
+
+# Helm n'installe les CRD d'un sous-chart qu'au PREMIER install : on les applique explicitement (idempotent).
+k8s-crds: k8s-deps   ## [N4] Installe / met à jour les CRD de Spark Operator (SparkApplication...)
+	tar -xzOf $$(ls $(HELM_CHART)/charts/spark-operator-*.tgz | tail -1) --wildcards 'spark-operator/crds/*.yaml' \
+	  | kubectl apply --server-side --force-conflicts -f - >/dev/null && echo "CRD Spark Operator à jour"
+
+k8s-install: k8s-files k8s-secrets k8s-crds   ## [N4] Installe / met à jour TOUTE la plateforme : un seul helm upgrade --install
 	helm upgrade --install $(K8S_RELEASE) $(HELM_CHART) -n $(K8S_NS) --create-namespace \
 	  -f helm/values-secrets.yaml --wait --timeout 20m
 
@@ -180,6 +189,14 @@ k8s-stream:          ## [N4] Flux continu de transactions (ROWS par lot, DURATIO
 
 k8s-trino:           ## [N4] Client SQL Trino dans le cluster (catalogue iceberg)
 	kubectl exec -it -n serving deploy/trino -- trino --catalog iceberg
+
+k8s-spark:           ## [N4] Applications Spark (SparkApplication) et leurs pods
+	@kubectl get sparkapplications -n processing
+	@echo; kubectl get pods -n processing -l spark-role --show-labels=false
+
+APP ?= stream-raw-to-silver
+k8s-spark-logs:      ## [N4] Journaux du driver d'une application Spark (APP=stream-raw-to-silver)
+	kubectl logs -n processing -f --tail=40 $$(kubectl get pods -n processing -l spark-role=driver,app.kubernetes.io/name=$(APP) -o name | tail -1)
 
 k8s-status:          ## [N4] Pods, volumes et URL de la plateforme
 	@kubectl get pods -A -l app.kubernetes.io/part-of=waba-platform -o wide

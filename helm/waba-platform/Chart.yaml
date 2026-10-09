@@ -7,3 +7,11 @@ description: >-
 type: application
 version: 0.1.0
 appVersion: "level4"
+
+# Seule dépendance externe : Spark Operator (CRD SparkApplication + webhook), installé dans « processing ».
+# `make k8s-deps` télécharge le chart dans charts/ (ignoré par git).
+dependencies:
+  - name: spark-operator
+    version: "~2.1.0"
+    repository: https://kubeflow.github.io/spark-operator
+    condition: spark-operator.enabled

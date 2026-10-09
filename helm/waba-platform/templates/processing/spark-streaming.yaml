@@ -1,0 +1,91 @@
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "processing") }}
+{{- if or .Values.spark.streaming.rawToSilver.enabled .Values.spark.streaming.fraudAml.enabled }}
+# Checkpoints du streaming (offsets Kafka + état du dédoublonnage / des fenêtres) : un volume partagé
+# par le driver et les executors (même nœud sur minikube ; stockage objet ou RWX en production).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: spark-checkpoints
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "spark-checkpoints") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.storageClass }}
+  resources: {requests: {storage: {{ .Values.spark.checkpointStorage }}}}
+{{- end }}
+{{- range $key, $job := .Values.spark.streaming }}
+{{- if $job.enabled }}
+---
+# Job Spark Structured Streaming lancé par Spark Operator : il tourne en continu et redémarre
+# automatiquement en cas d'échec (restartPolicy Always), en reprenant au dernier checkpoint.
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: {{ $job.name }}
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" $job.name) | nindent 4 }}
+spec:
+  type: Python
+  pythonVersion: "3"
+  mode: cluster
+  image: "{{ $.Values.spark.image }}:{{ $.Values.localImages.tag }}"
+  imagePullPolicy: {{ $.Values.localImages.pullPolicy }}
+  mainApplicationFile: "local:///opt/spark-apps/{{ $job.file }}"
+  sparkVersion: {{ $.Values.spark.version | quote }}
+  sparkConf:
+    {{- include "waba.sparkConf" $ | nindent 4 }}
+    spark.sql.shuffle.partitions: "4"
+    spark.executor.maxNumFailures: "10"                 # tolère quelques échecs d'executors au démarrage
+    spark.kubernetes.executor.deleteOnTermination: "true"
+    spark.sql.adaptive.enabled: "false"
+  restartPolicy:
+    type: Always
+    onFailureRetryInterval: 30
+    onSubmissionFailureRetryInterval: 30
+  volumes:
+    - name: checkpoints
+      persistentVolumeClaim: {claimName: spark-checkpoints}
+  driver:
+    cores: {{ $.Values.spark.driver.cores }}
+    memory: {{ $.Values.spark.driver.memory | quote }}
+    serviceAccount: spark
+    labels: {{- include "waba.component" (dict "ctx" $ "name" $job.name) | nindent 6 }}
+    annotations:
+      prometheus.io/scrape: "true"            # métriques Spark (servlet Prometheus de l'UI)
+      prometheus.io/port: "4040"
+      prometheus.io/path: /metrics/prometheus/
+    podSecurityContext: {fsGroup: 185}        # l'utilisateur spark (185) écrit dans le volume des checkpoints
+    env: {{- include "waba.sparkEnv" $ | nindent 6 }}
+    volumeMounts:
+      - {name: checkpoints, mountPath: /opt/spark-checkpoints}
+    # Sondes du driver (énoncé 4.1) : modèle de pod fusionné par Spark avec le pod qu'il crée
+    template:
+      spec:
+        containers:
+          - name: spark-kubernetes-driver
+            # Readiness = port RPC du driver (7078) ouvert. Elle doit passer en 1-2 s : le service DNS
+            # « headless » du driver ne publie que les pods prêts, et les executors (créés ~3 s après le
+            # démarrage) échouent avec UnknownHostException si le driver n'est pas encore « Ready » (cf. D27).
+            readinessProbe:
+              tcpSocket: {port: 7078}
+              initialDelaySeconds: 0
+              periodSeconds: 1
+              failureThreshold: 120
+            livenessProbe:
+              httpGet: {path: /, port: 4040}
+              initialDelaySeconds: 90
+              periodSeconds: 30
+              failureThreshold: 5
+  executor:
+    instances: {{ $.Values.spark.executor.instances }}
+    cores: {{ $.Values.spark.executor.cores }}
+    memory: {{ $.Values.spark.executor.memory | quote }}
+    labels: {{- include "waba.component" (dict "ctx" $ "name" (printf "%s-exec" $job.name)) | nindent 6 }}
+    podSecurityContext: {fsGroup: 185}
+    env: {{- include "waba.sparkEnv" $ | nindent 6 }}
+    volumeMounts:
+      - {name: checkpoints, mountPath: /opt/spark-checkpoints}
+{{- end }}
+{{- end }}

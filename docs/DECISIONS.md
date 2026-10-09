@@ -265,3 +265,25 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
   modifier dans le fichier hosts). Depuis Windows : `make k8s-expose` (port-forward du contrôleur Ingress).
 - **Initialisations** (buckets MinIO, topics Kafka) : Jobs Helm `post-install/post-upgrade`, idempotents, mêmes
   scripts qu'en Docker Compose (copiés dans le chart par `make k8s-files`).
+
+## D27 — Spark sur Kubernetes : Spark Operator et SparkApplication
+- **Spark Operator** (Kubeflow, chart `~2.1.0`, sous-chart dans `processing`) remplace le cluster Spark standalone :
+  chaque job est une ressource `SparkApplication` ; l'opérateur crée le pod driver, qui crée ses executors.
+  Pas de master ni de worker permanents : la mémoire n'est consommée que par les jobs qui tournent.
+- **Jobs streaming** : `restartPolicy: Always` (relance après 30 s en cas d'échec), checkpoints sur un PVC monté
+  par le driver et les executors (`/opt/spark-checkpoints`), même code et même image qu'en Docker Compose.
+- **Configuration** : en mode Kubernetes le driver est lancé avec `--properties-file`, le `spark-defaults.conf`
+  de l'image n'est pas lu : catalogue Iceberg et accès S3 sont repris dans `sparkConf` (helper `waba.sparkConf`).
+- **Sondes du driver** (énoncé 4.1) via le modèle de pod (`driver.template`) : readiness = port RPC du driver,
+  liveness = UI Spark. **Métriques** : servlet Prometheus natif de Spark
+  (`/metrics/prometheus/`, annotations `prometheus.io/*`) pour la supervision 4.4.
+- **CRD** : Helm n'installe les CRD d'un sous-chart qu'à la première installation ; `make k8s-crds` les applique
+  (idempotent) avant chaque `helm upgrade`.
+- **Webhook `failurePolicy: Ignore`** (vécu) : à l'installation, la SparkApplication est créée avant que le webhook
+  de l'opérateur réponde (`connection refused`) et Helm échoue. Avec `Ignore`, la création passe ; un pod Spark
+  créé pendant cette fenêtre (sans volumes ni secrets) échoue puis est relancé automatiquement.
+- **Readiness du driver = port RPC 7078** (vécu) : une première sonde HTTP sur l'UI (délai 30 s) rendait le driver
+  « non prêt » ; or le service DNS headless du driver ne publie que les pods prêts : les executors, créés 3 s après,
+  échouaient (`UnknownHostException ...-driver-svc`) et Spark abandonnait après 3 échecs. La sonde vérifie
+  maintenant ce dont les executors ont besoin (port RPC ouvert) et passe en 1-2 s ; liveness = UI Spark.
+- **Job 2 (fraude/AML)** activé après Airflow (4b.3) : il a besoin des référentiels `silver.customers/accounts`.

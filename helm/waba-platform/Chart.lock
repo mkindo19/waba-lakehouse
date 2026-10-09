@@ -1,0 +1,6 @@
+dependencies:
+- name: spark-operator
+  repository: https://kubeflow.github.io/spark-operator
+  version: 2.1.1
+digest: sha256:e3a3d4c69239ca8f33943a1cae3c17c23623c9c9b3329b9760523298a09f1aaa
+generated: "2026-10-09T01:32:26.54265255Z"

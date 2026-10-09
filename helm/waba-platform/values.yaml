@@ -111,3 +111,42 @@ trino:
   resources:
     requests: {cpu: 250m, memory: 2Gi}
     limits: {memory: 2560Mi}
+
+# ----------------------------------------------------------------------------- Spark sur Kubernetes
+# Spark Operator (sous-chart) : surveille le namespace processing et y lance les SparkApplication.
+spark-operator:
+  enabled: true
+  spark:
+    jobNamespaces: [processing]
+    serviceAccount: {create: true, name: spark}     # compte utilisé par les drivers Spark
+  controller:
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {memory: 512Mi}
+  webhook:
+    enable: true            # nécessaire pour injecter volumes, variables et secrets dans les pods Spark
+    # Ignore : un helm install complet crée la SparkApplication avant que le webhook soit prêt ; avec « Fail »
+    # l'installation échoue (connection refused). Un pod créé sans mutation échoue et est relancé (restartPolicy).
+    failurePolicy: Ignore
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {memory: 256Mi}
+
+spark:
+  image: waba/spark          # image maison (Iceberg, S3, Kafka, code des jobs), cf. spark/Dockerfile
+  version: "3.5.3"
+  checkpointStorage: 5Gi     # checkpoints du streaming (offsets Kafka + état), partagés driver / executors
+  ghsPerEur: "14.6"
+  driver: {cores: 1, memory: 1g}
+  executor: {instances: 1, cores: 1, memory: 1g}
+  streaming:
+    rawToSilver:
+      enabled: true
+      name: stream-raw-to-silver
+      file: stream_raw_to_silver.py
+    fraudAml:
+      enabled: false          # activé en 4b.3 : a besoin des référentiels silver (DAGs Airflow)
+      name: stream-fraud-aml
+      file: stream_fraud_aml.py
+  watermark: "2 days"
+  liquidityMinCoverage: "0.98"

@@ -1,6 +1,7 @@
 # Secrets
 .env
 helm/values-secrets.yaml
+helm/waba-platform/charts/
 *.pem
 *.key
 
