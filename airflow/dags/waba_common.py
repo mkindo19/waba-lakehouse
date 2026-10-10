@@ -7,7 +7,9 @@ Bonnes pratiques appliquées :
 - retries avec backoff + callback d'alerte structuré (JSON) en cas d'échec ;
 - toutes les tâches Spark partagent le pool `spark_pool` (1 slot) : un seul job à la
   fois sur le worker, pour ne pas saturer la mémoire (cf. piège exit code 52) ;
-- chaque DAG est paramétrable par pays (`country_code`) pour un backfill sélectif.
+- chaque DAG est paramétrable par pays (`country_code`) pour un backfill sélectif ;
+- même DAGs en Docker Compose et sur Kubernetes : seule la variable WABA_SPARK_MODE change la façon
+  de lancer Spark (spark-submit vers le cluster standalone, ou SparkApplication via Spark Operator).
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import logging
 import os
 from datetime import timedelta
 
+from airflow.models.baseoperator import BaseOperator
 from airflow.models.param import Param
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 
@@ -24,6 +27,7 @@ COUNTRIES = ["CI", "SN", "ML", "BF", "GN", "TG", "BJ", "GH"]
 SPARK_JOBS_DIR = os.environ.get("WABA_SPARK_JOBS_DIR", "/opt/airflow/spark-jobs")
 SPARK_DRIVER_HOST = os.environ.get("WABA_SPARK_DRIVER_HOST", "airflow-scheduler")
 SPARK_POOL = "spark_pool"
+SPARK_MODE = os.environ.get("WABA_SPARK_MODE", "standalone")    # standalone (Compose) | k8s (niveau 4)
 
 log = logging.getLogger("waba.alerts")
 
@@ -69,8 +73,17 @@ COUNTRY_PARAM = {
 COUNTRY_ARG = "{{ params.country_code }}"
 
 
-def spark_task(task_id: str, script: str, args: list[str] | None = None, **kwargs) -> SparkSubmitOperator:
-    """Soumet spark/jobs/<script> au cluster Spark (driver dans le container Airflow)."""
+def spark_task(task_id: str, script: str, args: list[str] | None = None, **kwargs) -> BaseOperator:
+    """Tâche Spark exécutant spark/jobs/<script>.
+
+    - k8s        : SparkApplication créée dans le namespace processing (Spark Operator), cf. waba_sparkapp ;
+    - standalone : spark-submit vers le cluster Spark de Docker Compose (driver dans le container Airflow).
+    """
+    if SPARK_MODE == "k8s":
+        from waba_sparkapp import SparkApplicationOperator
+
+        return SparkApplicationOperator(task_id=task_id, script=script, arguments=args or [], pool=SPARK_POOL,
+                                        **kwargs)
     return SparkSubmitOperator(
         task_id=task_id,
         application=f"{SPARK_JOBS_DIR}/{script}",

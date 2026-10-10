@@ -6,6 +6,7 @@
 #   - 2 retraits de 100 milliards XOF d'un autre compte     -> alerte de liquidité (gold-liquidity-alerts)
 #                                                            + R1 rafale sur ce 2e compte
 # Usage : scripts/alert_test.sh [PAYS UEMOA, défaut SN]
+# Kubernetes (niveau 4) : KAFKA_EXEC="kubectl exec -i -n ingestion kafka-0 --" KAFKA_BOOTSTRAP=localhost:9092
 set -euo pipefail
 
 COUNTRY="${1:-SN}"
@@ -24,7 +25,8 @@ msg() {  # id compte type montant horodatage
   msg "ALERT-TEST-$RUN-3" "TEST-$COUNTRY-BURST" TRANSFER 1500000 "$(ts now)"
   msg "ALERT-TEST-$RUN-4" "TEST-$COUNTRY-RUN" WITHDRAWAL 100000000000 "$(ts '-1 min')"
   msg "ALERT-TEST-$RUN-5" "TEST-$COUNTRY-RUN" WITHDRAWAL 100000000000 "$(ts now)"
-} | docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 \
+} | ${KAFKA_EXEC:-docker compose exec -T kafka} /opt/kafka/bin/kafka-console-producer.sh \
+      --bootstrap-server "${KAFKA_BOOTSTRAP:-kafka:9092}" \
       --topic raw-bank-transactions --property parse.key=true --property key.separator='|'
 
-echo "5 transactions de test publiées ($COUNTRY, lot $RUN). Dans ~1 min : make gold-peek"
+echo "5 transactions de test publiées ($COUNTRY, lot $RUN). Dans ~1 min : make gold-peek (Kubernetes : make k8s-gold-peek)"

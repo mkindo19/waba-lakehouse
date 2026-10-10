@@ -5,7 +5,7 @@ SPARK_SUBMIT := $(COMPOSE) exec -T spark-master /opt/spark/bin/spark-submit --ma
 DATASET ?= all
 COUNTRY ?=
 
-.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3 k8s-files k8s-secrets k8s-install k8s-status k8s-expose k8s-uninstall k8s-lint k8s-images k8s-referentials k8s-stream k8s-trino k8s-deps k8s-crds k8s-spark k8s-spark-logs
+.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3 k8s-files k8s-secrets k8s-install k8s-status k8s-expose k8s-uninstall k8s-lint k8s-images k8s-referentials k8s-stream k8s-trino k8s-deps k8s-crds k8s-spark k8s-spark-logs k8s-generate k8s-dag k8s-dag-runs k8s-dags-on k8s-alert-test k8s-gold-peek
 
 help:                ## Liste des commandes
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -147,11 +147,12 @@ K8S_HTTP_PORT ?= 8090
 HELM_CHART := helm/waba-platform
 
 k8s-files:           ## [N4] Copie les scripts de infra/ dans le chart (Helm ne lit que les fichiers du chart)
-	@mkdir -p $(HELM_CHART)/files/minio $(HELM_CHART)/files/kafka $(HELM_CHART)/files/nifi $(HELM_CHART)/files/trino-kafka
+	@mkdir -p $(HELM_CHART)/files/minio $(HELM_CHART)/files/kafka $(HELM_CHART)/files/nifi $(HELM_CHART)/files/trino-kafka $(HELM_CHART)/files/airflow-dags
 	@cp infra/minio/init.sh $(HELM_CHART)/files/minio/init.sh
 	@cp infra/kafka/create-topics.sh $(HELM_CHART)/files/kafka/create-topics.sh
 	@cp infra/nifi/deploy_flow.py $(HELM_CHART)/files/nifi/deploy_flow.py
 	@cp trino/kafka/*.json $(HELM_CHART)/files/trino-kafka/
+	@rm -f $(HELM_CHART)/files/airflow-dags/*.py && cp airflow/dags/*.py $(HELM_CHART)/files/airflow-dags/
 
 k8s-secrets: env     ## [N4] Génère helm/values-secrets.yaml depuis .env (ignoré par git)
 	@python3 scripts/k8s_values_secrets.py
@@ -182,6 +183,33 @@ k8s-images:          ## [N4] Construit les images maison (docker compose) et les
 k8s-referentials:    ## [N4] Génère les référentiels dans MinIO (pod generator)
 	kubectl exec -n ingestion deploy/generator -- python -m waba_gen referentials
 
+k8s-generate:        ## [N4] Génère un trimestre de fichiers de transactions dans MinIO (raw-landing)
+	kubectl exec -n ingestion deploy/generator -- python -m waba_gen batch
+
+DAG ?= dag_ingest_raw
+k8s-dag:             ## [N4] Active et déclenche un DAG Airflow (DAG=dag_ingest_raw)
+	kubectl exec -n processing deploy/airflow-scheduler -c scheduler -- airflow dags unpause $(DAG)
+	kubectl exec -n processing deploy/airflow-scheduler -c scheduler -- airflow dags trigger $(DAG)
+
+k8s-dags-on:         ## [N4] Active les DAGs de la chaîne batch (créés en pause) ; le rapport réglementaire reste à part
+	@for d in dag_ingest_raw dag_bronze_to_silver dag_silver_to_gold; do \
+	  kubectl exec -n processing deploy/airflow-scheduler -c scheduler -- airflow dags unpause $$d | grep -E "^dag_"; done
+
+k8s-dag-runs:        ## [N4] État des derniers runs des 4 DAGs et des SparkApplication
+	@for d in dag_ingest_raw dag_bronze_to_silver dag_silver_to_gold dag_regulatory_report; do \
+	  kubectl exec -n processing deploy/airflow-scheduler -c scheduler -- airflow dags list-runs -d $$d -o plain 2>/dev/null | head -4; done
+	@echo; kubectl get sparkapplications -n processing
+
+K8S_KAFKA := kubectl exec -i -n ingestion kafka-0 --
+k8s-alert-test:      ## [N4] Transactions de test (rafale, AML, liquidité) publiées dans Kafka sur K8s (COUNTRY=SN)
+	@KAFKA_EXEC="$(K8S_KAFKA)" KAFKA_BOOTSTRAP=localhost:9092 bash scripts/alert_test.sh $(or $(COUNTRY),SN)
+
+k8s-gold-peek:       ## [N4] Nombre de messages dans les topics gold-* (job 2 sur K8s)
+	@for t in gold-fraud-alerts gold-aml-events gold-liquidity-alerts; do \
+	  n=$$($(K8S_KAFKA) /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic $$t | awk -F: '{s+=$$3} END {print s+0}'); \
+	  echo "== $$t : $$n message(s)"; \
+	done
+
 ROWS ?= 2000
 DURATION ?= 90
 k8s-stream:          ## [N4] Flux continu de transactions (ROWS par lot, DURATION secondes)
@@ -204,7 +232,7 @@ k8s-status:          ## [N4] Pods, volumes et URL de la plateforme
 	@echo; kubectl get ingress -A -o custom-columns=NAMESPACE:.metadata.namespace,URL:.spec.rules[0].host
 
 k8s-expose:          ## [N4] Rend les interfaces accessibles depuis Windows : http://<ui>.localtest.me (laisser tourner)
-	@echo "Interfaces (port $(K8S_HTTP_PORT)) : kafka-ui, minio, generator, nifi/nifi, trino  ->  http://<nom>.localtest.me:$(K8S_HTTP_PORT)   (Ctrl+C pour arrêter)"
+	@echo "Interfaces (port $(K8S_HTTP_PORT)) : kafka-ui, minio, generator, nifi/nifi, trino, airflow  ->  http://<nom>.localtest.me:$(K8S_HTTP_PORT)   (Ctrl+C pour arrêter)"
 	kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller $(K8S_HTTP_PORT):80 --address 127.0.0.1
 
 k8s-uninstall:       ## [N4] Désinstalle la plateforme (les volumes de données sont conservés)

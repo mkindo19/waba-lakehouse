@@ -26,6 +26,7 @@ ingress:
     - {host: generator, component: generator, domain: ingestion, service: generator, port: 8501}
     - {host: nifi, component: nifi, domain: ingestion, service: nifi, port: 8080}
     - {host: trino, component: trino, domain: serving, service: trino, port: 8080}
+    - {host: airflow, component: airflow, domain: processing, service: airflow-webserver, port: 8080}
 
 storageClass: standard        # provisionneur minikube (hostPath)
 
@@ -42,7 +43,9 @@ s3:
 # Principe du moindre privilège : un namespace ne reçoit que les secrets dont il a besoin.
 secretKeys:
   ingestion: [WABA_S3_ACCESS_KEY, WABA_S3_SECRET_KEY, NIFI_SENSITIVE_PROPS_KEY]
-  processing: [MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, WABA_S3_ACCESS_KEY, WABA_S3_SECRET_KEY, PII_HASH_SALT]
+  processing: [MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, WABA_S3_ACCESS_KEY, WABA_S3_SECRET_KEY, PII_HASH_SALT,
+               AIRFLOW_DB_PASSWORD, AIRFLOW_FERNET_KEY, AIRFLOW_WEBSERVER_SECRET_KEY,
+               AIRFLOW_ADMIN_USER, AIRFLOW_ADMIN_PASSWORD]
   serving: [WABA_S3_ACCESS_KEY, WABA_S3_SECRET_KEY]
   governance: []
   monitoring: []
@@ -145,8 +148,38 @@ spark:
       name: stream-raw-to-silver
       file: stream_raw_to_silver.py
     fraudAml:
-      enabled: false          # activé en 4b.3 : a besoin des référentiels silver (DAGs Airflow)
+      enabled: true           # lit silver.customers / silver.accounts : 1er passage des DAGs fait avant (cf. D28)
       name: stream-fraud-aml
       file: stream_fraud_aml.py
   watermark: "2 days"
   liquidityMinCoverage: "0.98"
+  # Jobs batch lancés par Airflow (une SparkApplication par tâche, modèle rendu dans le ConfigMap
+  # airflow-spark-template). Supprimées par Spark Operator une heure après la fin (examen des échecs).
+  batch:
+    driver: {cores: 1, memory: 1g}
+    # memoryOverhead : mémoire HORS tas Java du pod executor (workers Python, buffers réseau...). Avec 2 cœurs
+    # = 2 workers Python ; 0.2 x 2g (410 Mo) ne suffisait pas -> OOMKilled (vécu, cf. D28).
+    executor: {instances: 1, cores: 2, memory: 2g, memoryOverhead: 1g}
+    shufflePartitions: "8"
+    ttlSeconds: 3600
+
+# ----------------------------------------------------------------------------- orchestration
+airflow:
+  enabled: true
+  image: waba/airflow        # image maison (cf. airflow/Dockerfile) ; DAGs montés depuis un ConfigMap
+  db:
+    image: postgres:16-alpine
+    storage: 2Gi             # base de métadonnées Airflow sur PVC (énoncé 4.1)
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {memory: 512Mi}
+  sparkPoolSlots: 1          # un job batch à la fois (mémoire du nœud minikube)
+  webserverWorkers: 2
+  scheduler:
+    resources:
+      requests: {cpu: 200m, memory: 512Mi}
+      limits: {memory: 2Gi}
+  webserver:
+    resources:
+      requests: {cpu: 100m, memory: 512Mi}
+      limits: {memory: 1536Mi}

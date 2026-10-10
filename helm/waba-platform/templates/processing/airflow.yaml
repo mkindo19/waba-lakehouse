@@ -1,0 +1,257 @@
+{{- if .Values.airflow.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "processing") }}
+{{- $image := printf "%s:%s" .Values.airflow.image .Values.localImages.tag }}
+# =============================================================================
+# Airflow (LocalExecutor) : base PostgreSQL sur PVC, scheduler, webserver.
+# Les tâches Spark des DAGs créent des SparkApplication (Spark Operator) dans ce namespace.
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: airflow-db-data
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow-db") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep      # historique des runs conservé après helm uninstall
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.storageClass }}
+  resources: {requests: {storage: {{ .Values.airflow.db.storage }}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-db
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow-db") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "airflow-db") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow-db") | nindent 8 }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.airflow.db.image }}
+          env:
+            - {name: POSTGRES_USER, value: airflow}
+            - {name: POSTGRES_DB, value: airflow}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: AIRFLOW_DB_PASSWORD}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}   # sous-dossier : volume pas forcément vide
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, airflow, -d, airflow]}
+            periodSeconds: 10
+          livenessProbe:
+            exec: {command: [pg_isready, -U, airflow, -d, airflow]}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources: {{- toYaml .Values.airflow.db.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: airflow-db-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-db
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow-db") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "airflow-db") | nindent 4 }}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+# DAGs (copiés de airflow/dags par make k8s-files) et modèle de SparkApplication des jobs batch
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: airflow-dags
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/airflow-dags/*.py").AsConfig | nindent 2 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: airflow-spark-template
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow") | nindent 4 }}
+data:
+  sparkapplication.yaml: |
+    {{- include "waba.sparkBatchApp" . | nindent 4 }}
+---
+# Droits du compte « airflow » : créer / suivre / supprimer des SparkApplication et lire le journal des drivers,
+# uniquement dans ce namespace (Role, pas ClusterRole).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: airflow
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow") | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: airflow-spark
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow") | nindent 4 }}
+rules:
+  - apiGroups: [sparkoperator.k8s.io]
+    resources: [sparkapplications]
+    verbs: [create, get, list, watch, delete]
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: airflow-spark
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow") | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: airflow-spark}
+subjects:
+  - {kind: ServiceAccount, name: airflow, namespace: {{ $ns }}}
+---
+# Scheduler (+ exécution des tâches, LocalExecutor). Au démarrage : copie des DAGs, puis migration de la
+# base, compte admin et pool Spark (idempotent). Pas de hook Helm : avec --wait, Helm attend que les pods
+# soient prêts AVANT les hooks post-install, or le webserver a besoin de la base migrée pour être prêt.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-scheduler
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow-scheduler") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}           # un seul scheduler LocalExecutor
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "airflow-scheduler") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow-scheduler") | nindent 8 }}
+      annotations:
+        # DAGs ou modèle Spark modifiés -> helm upgrade redémarre le scheduler
+        checksum/dags: {{ (.Files.Glob "files/airflow-dags/*.py").AsConfig | sha256sum }}
+        checksum/spark-template: {{ include "waba.sparkBatchApp" . | sha256sum }}
+    spec:
+      serviceAccountName: airflow
+      initContainers:
+        - name: copy-dags                # ConfigMap -> dossier ordinaire (évite les liens ..data en double)
+          image: {{ $image }}
+          imagePullPolicy: {{ .Values.localImages.pullPolicy }}
+          command: [bash, -c, "cp /dags-src/*.py /opt/airflow/dags/ && ls /opt/airflow/dags"]
+          volumeMounts:
+            - {name: dags-src, mountPath: /dags-src}
+            - {name: dags, mountPath: /opt/airflow/dags}
+        - name: init-db
+          image: {{ $image }}
+          imagePullPolicy: {{ .Values.localImages.pullPolicy }}
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              until airflow db check >/dev/null 2>&1; do echo "attente de airflow-db..."; sleep 5; done
+              airflow db migrate
+              airflow users create --role Admin --username "$AIRFLOW_ADMIN_USER" --password "$AIRFLOW_ADMIN_PASSWORD" \
+                --firstname WABA --lastname Admin --email admin@waba.local || true
+              airflow pools set spark_pool {{ .Values.airflow.sparkPoolSlots }} "Jobs Spark simultanés (mémoire du nœud)"
+          env:
+            {{- include "waba.airflowEnv" . | nindent 12 }}
+            - name: AIRFLOW_ADMIN_USER
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: AIRFLOW_ADMIN_USER}}
+            - name: AIRFLOW_ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: AIRFLOW_ADMIN_PASSWORD}}
+      containers:
+        - name: scheduler
+          image: {{ $image }}
+          imagePullPolicy: {{ .Values.localImages.pullPolicy }}
+          args: [scheduler]
+          env: {{- include "waba.airflowEnv" . | nindent 12 }}
+          ports:
+            - {name: logs, containerPort: 8793}      # journaux des tâches, lus par le webserver
+            - {name: health, containerPort: 8974}
+          livenessProbe:
+            httpGet: {path: /health, port: health}
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          resources: {{- toYaml .Values.airflow.scheduler.resources | nindent 12 }}
+          volumeMounts:
+            - {name: dags, mountPath: /opt/airflow/dags}
+            - {name: spark-template, mountPath: /opt/airflow/spark-k8s, readOnly: true}
+            - {name: logs, mountPath: /opt/airflow/logs}
+      volumes:
+        - name: dags-src
+          configMap: {name: airflow-dags}
+        - name: dags
+          emptyDir: {}
+        - name: spark-template
+          configMap: {name: airflow-spark-template}
+        - name: logs                     # journaux des tâches (historique durable : Loki, niveau 4.4)
+          emptyDir: {sizeLimit: 2Gi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-webserver
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow-webserver") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "airflow-webserver") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow-webserver") | nindent 8 }}
+    spec:
+      serviceAccountName: airflow
+      initContainers:
+        - name: wait-migrations          # attend que le scheduler ait migré la base
+          image: {{ $image }}
+          imagePullPolicy: {{ .Values.localImages.pullPolicy }}
+          args: [db, check-migrations, --migration-wait-timeout, "900"]
+          env: {{- include "waba.airflowEnv" . | nindent 12 }}
+      containers:
+        - name: webserver
+          image: {{ $image }}
+          imagePullPolicy: {{ .Values.localImages.pullPolicy }}
+          args: [webserver]
+          env: {{- include "waba.airflowEnv" . | nindent 12 }}
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          resources: {{- toYaml .Values.airflow.webserver.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-webserver
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "airflow-webserver") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "airflow-webserver") | nindent 4 }}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+{{- end }}

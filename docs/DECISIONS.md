@@ -287,3 +287,43 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
   échouaient (`UnknownHostException ...-driver-svc`) et Spark abandonnait après 3 échecs. La sonde vérifie
   maintenant ce dont les executors ont besoin (port RPC ouvert) et passe en 1-2 s ; liveness = UI Spark.
 - **Job 2 (fraude/AML)** activé après Airflow (4b.3) : il a besoin des référentiels `silver.customers/accounts`.
+
+## D28 — Airflow sur Kubernetes : DAGs inchangés, jobs batch en SparkApplication
+- **Mêmes DAGs** qu'en Docker Compose : seule `spark_task()` (waba_common) change de comportement selon
+  `WABA_SPARK_MODE` : `standalone` -> `SparkSubmitOperator` (Compose), `k8s` -> `SparkApplicationOperator`.
+- **Opérateur maison** (`airflow/dags/waba_sparkapp.py`, ~100 lignes) : crée la `SparkApplication`, suit
+  `status.applicationState` jusqu'à `COMPLETED` / `FAILED`, recopie la fin du journal du driver dans Airflow, et la
+  supprime si la tâche est interrompue (timeout, arrêt manuel). Écarté : `SparkKubernetesOperator` (provider
+  cncf.kubernetes 10.1) retrouve le pod driver grâce à des étiquettes qu'il n'ajoute pas au modèle ; sans elles il
+  ne trouve pas le pod et la tâche peut être marquée réussie alors que Spark a échoué (lu dans son code source).
+- **Modèle de SparkApplication rendu par Helm** (ConfigMap `airflow-spark-template`, helper `waba.sparkBatchApp`) :
+  image, catalogue Iceberg, S3, secrets et ressources sont décrits une seule fois dans le chart, partagés avec le
+  streaming ; le DAG n'apporte que le script, ses arguments et des étiquettes (`waba/dag-id`, `waba/task-id`,
+  `waba/country`) reprises par les pods (métriques et journaux par pays, niveau 4.4).
+- **Nettoyage** : `timeToLiveSeconds: 3600` -> Spark Operator supprime l'application (et ses pods) 1 h après la
+  fin : le temps d'examiner un échec. Les nouvelles tentatives sont gérées par Airflow (`restartPolicy: Never`).
+- **Droits minimaux** : compte de service `airflow` + `Role` limité au namespace `processing`
+  (sparkapplications : create/get/list/watch/delete ; pods et pods/log : lecture).
+- **Démarrage sans hook Helm** : avec `--wait`, Helm attend que les pods soient prêts avant les hooks
+  post-install, or le webserver a besoin d'une base migrée pour être prêt. La migration (+ compte admin + pool)
+  se fait donc dans un initContainer du scheduler (idempotent) ; le webserver attend
+  (`airflow db check-migrations`).
+- **DAGs** : ConfigMap généré depuis `airflow/dags` (`make k8s-files`), copié au démarrage dans un dossier ordinaire
+  (un ConfigMap monté contient des liens `..data` que le scanner de DAGs lirait en double). Une annotation
+  `checksum/dags` redémarre le scheduler quand un DAG change. En production : git-sync ou image versionnée.
+- **Journaux des tâches** : écrits par le scheduler (LocalExecutor) et lus par le webserver sur le port 8793 ;
+  le nom d'hôte d'un pod n'étant pas résolu par le DNS, Airflow publie l'IP du pod (`hostname_callable`).
+  Volume `emptyDir` : l'historique durable des journaux passera par Loki (4.4).
+- **Base de métadonnées** : PostgreSQL 16 sur PVC `airflow-db-data` (`keep`), mot de passe injecté par
+  `secretKeyRef` puis substitué dans l'URL SQLAlchemy par Kubernetes (`$(AIRFLOW_DB_PASSWORD)`).
+- **Mémoire** : un seul job batch à la fois (pool `spark_pool` = 1 slot) ; driver 1g, executor 2g de tas Java
+  + `memoryOverhead` 1g. Vécu : avec un overhead de 0.2 x 2g (410 Mo), l'executor a été tué par Kubernetes
+  (`OOMKilled`, code 137) pendant `ingest_raw` : la limite du pod (= tas + overhead) doit aussi contenir les
+  workers Python (un par cœur) et la mémoire hors tas de la JVM. En Docker Compose, le worker n'avait pas de
+  limite de conteneur : le problème n'apparaissait pas. Après 3 executors perdus, Spark arrête l'application ;
+  Spark Operator la passe en `FAILED`, l'opérateur Airflow échoue et Airflow relance la tâche (retries).
+- **DAGs créés en pause** (`DAGS_ARE_PAUSED_AT_CREATION`, comme en Compose) (vécu) : un `TriggerDagRunOperator` crée
+  bien le run du DAG suivant, mais il reste `queued` tant que ce DAG est en pause. `make k8s-dags-on` active la chaîne
+  ingest -> silver -> gold ; `dag_regulatory_report` est activé séparément (alerte J+1 06:00, 4.4).
+- **Job 2 (fraude/AML)** activé une fois `silver.customers` / `silver.accounts` produits par les DAGs ; avant, ses
+  référentiels n'existent pas et la SparkApplication échouerait en boucle (`restartPolicy: Always`).
