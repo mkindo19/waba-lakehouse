@@ -33,6 +33,7 @@ from common.datasets import CATALOG
 from common.fx import DEFAULT_GHS_PER_EUR
 from common.logging_utils import get_logger
 from common.quality import REASON_COL
+from common.stream_monitor import StreamMonitor
 from common.stream_sinks import CHECKPOINT_ROOT, KAFKA, SinkLedger, merge_iceberg, write_kafka
 from common.streaming import (
     DLQ_TOPIC,
@@ -87,10 +88,22 @@ def make_batch_writer(dataset: str, ghs_per_eur: float):
             write_kafka(kafka_messages(silver), spec.silver_topic)
         ledger.done(batch_id)
 
-        lag = batch.agg(F.max(F.col("_kafka_ts").cast("double"))).first()[0]
+        # Latence par pays (niveau 4.4, Grafana via Loki) : du dépôt dans Kafka à la fin de l'écriture silver,
+        # pour le message le plus ancien du micro-lot (pire cas) et le plus récent.
+        done_ts = datetime.now(timezone.utc).timestamp()
+        per_country = (batch.filter(F.col("country_code").isNotNull()).groupBy("country_code")
+                       .agg(F.min(F.col("_kafka_ts").cast("double")).alias("oldest"),
+                            F.max(F.col("_kafka_ts").cast("double")).alias("newest"),
+                            F.count("*").alias("rows"))
+                       .collect())
+        for r in per_country:
+            log.info("latence par pays", extra={"ctx": {
+                "dataset": dataset, "batch_id": batch_id, "country_code": r["country_code"], "rows": r["rows"],
+                "lag_s": round(done_ts - r["oldest"], 1), "lag_min_s": round(done_ts - r["newest"], 1),
+            }})
         log.info("micro-lot traité", extra={"ctx": {
             "dataset": dataset, "batch_id": batch_id, "valid": n_valid, "rejected": n_rejected,
-            "lag_s": round(datetime.now(timezone.utc).timestamp() - lag, 1) if lag else None,
+            "lag_s": max((round(done_ts - r["oldest"], 1) for r in per_country), default=None),
         }})
         silver.unpersist()
         batch.unpersist()
@@ -130,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     spark = SparkSession.builder.appName("stream_raw_to_silver").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.silver")
+    spark.streams.addListener(StreamMonitor(spark, "raw_to_silver", KAFKA))   # supervision (niveau 4.4)
     for dataset in args.datasets:
         start_query(spark, dataset, args.trigger, args.ghs_per_eur)
         log.info("requête de streaming démarrée", extra={"ctx": {"dataset": dataset, "trigger": args.trigger}})

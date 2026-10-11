@@ -1,0 +1,38 @@
+# Grafana WABA (niveau 4.4) — sources de données provisionnées « as code » (uid fixes : référencés par le
+# dashboard et les alertes). Les ${VARIABLES} sont remplacées par Grafana au démarrage (variables du pod,
+# lues dans le Secret waba-secrets) : aucun mot de passe dans ce fichier.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus.monitoring.svc.cluster.local:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s          # = scrape_interval : $__rate_interval correct
+      prometheusType: Prometheus
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki.monitoring.svc.cluster.local:3100
+    jsonData:
+      maxLines: 1000
+
+  # Base de métadonnées Airflow, en LECTURE SEULE (rôle grafana_reader : SELECT sur dag_run uniquement, créé
+  # par l'init du scheduler Airflow). Sert à l'alerte « rapport réglementaire absent à J+1 06h00 UTC ».
+  - name: Airflow DB (lecture seule)
+    uid: airflow-db
+    type: grafana-postgresql-datasource
+    url: airflow-db.processing.svc.cluster.local:5432
+    user: grafana_reader
+    jsonData:
+      database: airflow
+      sslmode: disable
+      postgresVersion: 1600
+      maxOpenConns: 2
+    secureJsonData:
+      password: ${GRAFANA_DB_READER_PASSWORD}

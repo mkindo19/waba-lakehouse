@@ -1,0 +1,13 @@
+# Grafana WABA — les dashboards JSON de monitoring/grafana/dashboards/ sont chargés au démarrage
+# (dossier « WABA »). Modifications faites dans l'interface : non sauvegardables (as code -> éditer le JSON).
+apiVersion: 1
+
+providers:
+  - name: waba
+    folder: WABA
+    folderUid: waba
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

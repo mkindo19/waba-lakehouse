@@ -35,6 +35,7 @@ from pyspark.sql import functions as F
 from common import fraud
 from common.datasets import CATALOG
 from common.logging_utils import get_logger
+from common.stream_monitor import StreamMonitor
 from common.stream_sinks import CHECKPOINT_ROOT, KAFKA, merge_iceberg, write_kafka
 
 log = get_logger("stream_fraud_aml")
@@ -191,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     spark = SparkSession.builder.appName("stream_fraud_aml").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.gold")
+    spark.streams.addListener(StreamMonitor(spark, "fraud_aml", KAFKA))   # supervision (niveau 4.4)
     log.info("règles", extra={"ctx": {"rules": fraud.describe_rules(), "watermark": WATERMARK,
                                       "min_coverage": MIN_COVERAGE}})
     queries = build_queries(spark)

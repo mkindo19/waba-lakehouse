@@ -166,8 +166,29 @@ spec:
               airflow users create --role Admin --username "$AIRFLOW_ADMIN_USER" --password "$AIRFLOW_ADMIN_PASSWORD" \
                 --firstname WABA --lastname Admin --email admin@waba.local || true
               airflow pools set spark_pool {{ .Values.airflow.sparkPoolSlots }} "Jobs Spark simultanés (mémoire du nœud)"
+              # Rôle PostgreSQL en LECTURE SEULE pour Grafana (alerte « rapport réglementaire », table des runs) :
+              # SELECT sur dag_run uniquement, jamais le compte propriétaire « airflow » (moindre privilège).
+              python - <<'PY'
+              import os
+              import psycopg2
+              from psycopg2 import sql
+              conn = psycopg2.connect(host="airflow-db", dbname="airflow", user="airflow",
+                                      password=os.environ["AIRFLOW_DB_PASSWORD"])
+              conn.autocommit = True
+              with conn.cursor() as cur:
+                  cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'grafana_reader'")
+                  verb = "ALTER" if cur.fetchone() else "CREATE"
+                  cur.execute(sql.SQL(verb + " ROLE grafana_reader LOGIN PASSWORD {}")
+                              .format(sql.Literal(os.environ["GRAFANA_DB_READER_PASSWORD"])))
+                  cur.execute("GRANT CONNECT ON DATABASE airflow TO grafana_reader")
+                  cur.execute("GRANT USAGE ON SCHEMA public TO grafana_reader")
+                  cur.execute("GRANT SELECT ON dag_run TO grafana_reader")
+              print(f"rôle grafana_reader : {verb} OK (lecture seule sur dag_run)")
+              PY
           env:
             {{- include "waba.airflowEnv" . | nindent 12 }}
+            - name: GRAFANA_DB_READER_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: GRAFANA_DB_READER_PASSWORD}}
             - name: AIRFLOW_ADMIN_USER
               valueFrom: {secretKeyRef: {name: waba-secrets, key: AIRFLOW_ADMIN_USER}}
             - name: AIRFLOW_ADMIN_PASSWORD

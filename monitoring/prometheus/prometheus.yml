@@ -1,0 +1,79 @@
+# Prometheus WABA (niveau 4.4) — collecte des métriques de la plateforme.
+# Validation locale : promtool check config monitoring/prometheus/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    platform: waba
+
+scrape_configs:
+  # --- Pods annotés prometheus.io/scrape=true : drivers Spark (servlet Prometheus de l'UI, 4040), MinIO...
+  - job_name: kubernetes-pods
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      - source_labels: [__meta_kubernetes_pod_phase]
+        action: keep
+        regex: Running
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      # app = étiquette app.kubernetes.io/name du pod (stream-fraud-aml, spark-batch, minio...)
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        target_label: app
+      - source_labels: [__meta_kubernetes_pod_label_spark_role]
+        target_label: spark_role
+      # étiquettes posées par l'opérateur Airflow sur les jobs batch (waba/dag-id, waba/task-id, waba/country)
+      - source_labels: [__meta_kubernetes_pod_label_waba_dag_id]
+        target_label: dag_id
+      - source_labels: [__meta_kubernetes_pod_label_waba_task_id]
+        target_label: task_id
+      - source_labels: [__meta_kubernetes_pod_label_waba_country]
+        target_label: country_code
+
+  # --- Kafka : offsets des topics et retard des groupes de consommateurs (dont waba-spark.*, cf. stream_monitor)
+  - job_name: kafka
+    static_configs:
+      - targets: [kafka-exporter.monitoring.svc.cluster.local:9308]
+
+  # --- Airflow : métriques StatsD (DAG runs, tâches) converties par statsd-exporter
+  - job_name: airflow
+    static_configs:
+      - targets: [statsd-exporter.monitoring.svc.cluster.local:9102]
+
+  # --- NiFi : point de sortie Prometheus natif de l'API (débit des processeurs, files d'attente)
+  - job_name: nifi
+    metrics_path: /nifi-api/flow/metrics/prometheus
+    static_configs:
+      - targets: [nifi.ingestion.svc.cluster.local:8080]
+
+  # --- Trino : métriques OpenMetrics (requêtes en cours, échecs, mémoire). Sans authentification
+  # configurée, Trino exige seulement le nom d'utilisateur dans l'en-tête X-Trino-User.
+  - job_name: trino
+    metrics_path: /metrics
+    http_headers:
+      X-Trino-User:
+        values: [prometheus]
+    static_configs:
+      - targets: [trino.serving.svc.cluster.local:8080]
+
+  # --- Supervision elle-même
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]
+  - job_name: loki
+    static_configs:
+      - targets: [loki.monitoring.svc.cluster.local:3100]

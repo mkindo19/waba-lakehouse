@@ -1,0 +1,62 @@
+# Promtail WABA (niveau 4.4) — collecte des journaux de TOUS les pods (DaemonSet) vers Loki.
+# Les journaux des jobs Spark (lignes JSON de common/logging_utils.py) sont analysés : niveau et message.
+# Validation locale : promtail -config.file=monitoring/promtail/promtail.yaml -check-syntax
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  filename: /run/promtail/positions.yaml
+
+clients:
+  - url: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: kubernetes-pods
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      # uniquement les pods du nœud de ce Promtail (un Promtail par nœud)
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        target_label: __host__
+      - action: drop
+        regex: ""
+        source_labels: [__meta_kubernetes_pod_uid]
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_container_name]
+        target_label: container
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        target_label: app
+      - source_labels: [__meta_kubernetes_pod_label_spark_role]
+        target_label: spark_role
+      # fichier du journal sur le nœud : /var/log/pods/<ns>_<pod>_<uid>/<conteneur>/<n>.log
+      - source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
+        separator: /
+        target_label: __path__
+        replacement: /var/log/pods/*$1/*.log
+    pipeline_stages:
+      # Format du fichier selon le runtime du nœud : « docker » (minikube --driver=docker, cri-dockerd : JSON
+      # {"log","stream","time"}) ou « cri » (containerd, CRI-O : « <heure> stdout F <ligne> »). Chaque étape
+      # laisse intactes les lignes qui ne sont pas à son format : les deux à la suite couvrent les deux runtimes.
+      - docker: {}
+      - cri: {}
+      # Jobs Spark : lignes JSON {"ts", "level", "logger", "msg", ...contexte}
+      - match:
+          selector: '{app=~"stream-.*|spark-batch.*"}'
+          stages:
+            - json:
+                expressions:
+                  level: level
+                  logger: logger
+                  ts: ts
+            - labels:
+                level:
+                logger:
+            - timestamp:
+                source: ts
+                format: RFC3339Nano
+                action_on_failure: skip

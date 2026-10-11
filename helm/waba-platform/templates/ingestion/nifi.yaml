@@ -44,9 +44,9 @@ spec:
           env:
             - {name: NIFI_WEB_HTTP_PORT, value: "8080"}
             - {name: NIFI_WEB_HTTP_HOST, value: "0.0.0.0"}
-            # En-têtes Host acceptés (protection DNS rebinding) : Ingress + service interne
+            # En-têtes Host acceptés (protection DNS rebinding) : Ingress, service interne, Prometheus (nom complet)
             - name: NIFI_WEB_PROXY_HOST
-              value: "nifi.{{ .Values.ingress.domain }}:{{ .Values.ingress.port }},nifi.{{ .Values.ingress.domain }},nifi:8080"
+              value: "nifi.{{ .Values.ingress.domain }}:{{ .Values.ingress.port }},nifi.{{ .Values.ingress.domain }},nifi:8080,{{ include "waba.svc" (dict "ctx" . "domain" "ingestion" "name" "nifi") }}:8080"
             - name: NIFI_SENSITIVE_PROPS_KEY
               valueFrom: {secretKeyRef: {name: waba-secrets, key: NIFI_SENSITIVE_PROPS_KEY}}
             - {name: NIFI_JVM_HEAP_INIT, value: {{ .Values.nifi.heapInit | quote }}}

@@ -117,6 +117,7 @@ spec:
     spark.cleaner.referenceTracking.cleanCheckpoints: "true"
   driver:
     cores: {{ $b.driver.cores }}
+    coreRequest: {{ $b.driver.coreRequest | quote }}
     memory: {{ $b.driver.memory | quote }}
     serviceAccount: spark
     labels:
@@ -129,6 +130,7 @@ spec:
   executor:
     instances: {{ $b.executor.instances }}
     cores: {{ $b.executor.cores }}
+    coreRequest: {{ $b.executor.coreRequest | quote }}
     memory: {{ $b.executor.memory | quote }}
     memoryOverhead: {{ $b.executor.memoryOverhead | quote }}   # limite du pod = memory + memoryOverhead
     labels:
@@ -165,6 +167,13 @@ spec:
 - {name: WABA_SPARK_MODE, value: k8s}
 - {name: WABA_SPARK_NAMESPACE, value: {{ include "waba.ns" (dict "ctx" . "domain" "processing") }}}
 - {name: WABA_SPARK_APP_TEMPLATE, value: /opt/airflow/spark-k8s/sparkapplication.yaml}
+{{- if .Values.monitoring.enabled }}
+# Métriques StatsD (UDP) -> statsd-exporter -> Prometheus (supervision 4.4 : taux d'erreur des DAGs)
+- {name: AIRFLOW__METRICS__STATSD_ON, value: "True"}
+- {name: AIRFLOW__METRICS__STATSD_HOST, value: {{ include "waba.svc" (dict "ctx" . "domain" "monitoring" "name" "statsd-exporter") | quote }}}
+- {name: AIRFLOW__METRICS__STATSD_PORT, value: "9125"}
+- {name: AIRFLOW__METRICS__STATSD_PREFIX, value: airflow}
+{{- end }}
 {{ include "waba.s3Env" . }}
 {{- end -}}
 

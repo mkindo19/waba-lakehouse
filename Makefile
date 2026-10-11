@@ -149,11 +149,15 @@ HELM_CHART := helm/waba-platform
 k8s-files:           ## [N4] Copie les scripts de infra/ dans le chart (Helm ne lit que les fichiers du chart)
 	@mkdir -p $(HELM_CHART)/files/minio $(HELM_CHART)/files/kafka $(HELM_CHART)/files/nifi $(HELM_CHART)/files/trino-kafka $(HELM_CHART)/files/airflow-dags $(HELM_CHART)/files/superset
 	@cp infra/minio/init.sh $(HELM_CHART)/files/minio/init.sh
+	@mkdir -p $(HELM_CHART)/files/iceberg && cp infra/iceberg/migrate_catalog.py $(HELM_CHART)/files/iceberg/
 	@cp infra/kafka/create-topics.sh $(HELM_CHART)/files/kafka/create-topics.sh
 	@cp infra/nifi/deploy_flow.py $(HELM_CHART)/files/nifi/deploy_flow.py
 	@cp trino/kafka/*.json $(HELM_CHART)/files/trino-kafka/
 	@rm -f $(HELM_CHART)/files/airflow-dags/*.py && cp airflow/dags/*.py $(HELM_CHART)/files/airflow-dags/
 	@cp superset/superset_config.py superset/dashboards/build_assets.py superset/dashboards/import_assets.py $(HELM_CHART)/files/superset/
+	@rm -rf $(HELM_CHART)/files/monitoring && mkdir -p $(HELM_CHART)/files/monitoring/grafana
+	@cp -r monitoring/prometheus monitoring/loki monitoring/promtail monitoring/statsd $(HELM_CHART)/files/monitoring/
+	@cp -r monitoring/grafana/provisioning monitoring/grafana/dashboards $(HELM_CHART)/files/monitoring/grafana/
 
 k8s-secrets: env     ## [N4] Génère helm/values-secrets.yaml depuis .env (ignoré par git)
 	@python3 scripts/k8s_values_secrets.py
@@ -219,6 +223,24 @@ k8s-gold-peek:       ## [N4] Nombre de messages dans les topics gold-* (job 2 su
 	  echo "== $$t : $$n message(s)"; \
 	done
 
+# --- Supervision (niveau 4.4) : démonstration des alertes Grafana (cf. D30)
+k8s-lag:             ## [N4] Retard (lag) des groupes de supervision des jobs Spark (waba-spark.*)
+	@$(K8S_KAFKA) /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --all-groups 2>/dev/null \
+	  | awk '$$1=="GROUP" && !h {h=1; printf "%-34s %-28s %4s %10s %10s %8s\n", $$1,$$2,$$3,$$4,$$5,$$6} \
+	         $$1 ~ /^waba-spark/ {printf "%-34s %-28s %4s %10s %10s %8s\n", $$1,$$2,$$3,$$4,$$5,$$6}'
+
+k8s-demo-break:      ## [N4] DÉMO alertes : casse le job fraude (fichier principal inexistant) -> échecs en boucle
+	kubectl -n processing patch sparkapplication stream-fraud-aml --type merge \
+	  -p '{"spec":{"mainApplicationFile":"local:///opt/spark-apps/demo_fichier_absent.py"}}'
+	@echo "Job fraude cassé. Suivi : make k8s-spark ; Grafana : http://grafana.localtest.me:$(K8S_HTTP_PORT)"
+
+# Helm ne corrige pas un champ modifié à la main sur une ressource personnalisée (patch à deux voies) : on remet
+# explicitement la valeur du chart.
+k8s-demo-repair:     ## [N4] DÉMO alertes : rétablit le job fraude
+	kubectl -n processing patch sparkapplication stream-fraud-aml --type merge \
+	  -p '{"spec":{"mainApplicationFile":"local:///opt/spark-apps/stream_fraud_aml.py"}}'
+	@echo "Job fraude rétabli (redémarrage du driver en ~1 min)."
+
 ROWS ?= 2000
 DURATION ?= 90
 k8s-stream:          ## [N4] Flux continu de transactions (ROWS par lot, DURATION secondes)
@@ -245,7 +267,7 @@ k8s-status:          ## [N4] Pods, volumes et URL de la plateforme
 	@echo; kubectl get ingress -A -o custom-columns=NAMESPACE:.metadata.namespace,URL:.spec.rules[0].host
 
 k8s-expose:          ## [N4] Rend les interfaces accessibles depuis Windows : http://<ui>.localtest.me (laisser tourner)
-	@echo "Interfaces (port $(K8S_HTTP_PORT)) : kafka-ui, minio, generator, nifi/nifi, trino, airflow, superset  ->  http://<nom>.localtest.me:$(K8S_HTTP_PORT)   (Ctrl+C pour arrêter)"
+	@echo "Interfaces (port $(K8S_HTTP_PORT)) : kafka-ui, minio, generator, nifi/nifi, trino, airflow, superset, grafana, prometheus  ->  http://<nom>.localtest.me:$(K8S_HTTP_PORT)   (Ctrl+C pour arrêter)"
 	kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller $(K8S_HTTP_PORT):80 --address 127.0.0.1
 
 k8s-uninstall:       ## [N4] Désinstalle la plateforme (les volumes de données sont conservés)

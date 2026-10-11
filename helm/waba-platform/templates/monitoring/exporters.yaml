@@ -1,0 +1,106 @@
+{{- if .Values.monitoring.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "monitoring") }}
+{{- $m := .Values.monitoring }}
+# =============================================================================
+# Exporteurs (énoncé 4.4) : traduisent en métriques Prometheus ce que Kafka et Airflow n'exposent pas eux-mêmes.
+#  - kafka-exporter : offsets des topics et retard (lag) des groupes de consommateurs, dont « waba-spark.* »
+#    (offsets committés par StreamMonitor, cf. spark/jobs/common/stream_monitor.py) ;
+#  - statsd-exporter : reçoit les métriques StatsD d'Airflow (UDP 9125) et les expose (9102) avec étiquettes.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-exporter
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "kafka-exporter") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "kafka-exporter") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "kafka-exporter") | nindent 8 }}
+    spec:
+      containers:
+        - name: kafka-exporter
+          image: {{ $m.kafkaExporter.image }}
+          args:
+            - --kafka.server={{ include "waba.svc" (dict "ctx" $ "domain" "ingestion" "name" "kafka") }}:9092
+            - --kafka.version={{ $m.kafkaExporter.kafkaVersion }}
+            - --offset.show-all          # aussi les groupes sans consommateur connecté (job Spark arrêté)
+          ports:
+            - {name: metrics, containerPort: 9308}
+          readinessProbe:
+            tcpSocket: {port: metrics}
+            periodSeconds: 10
+          resources: {{- toYaml $m.kafkaExporter.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-exporter
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "kafka-exporter") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "kafka-exporter") | nindent 4 }}
+  ports:
+    - {name: metrics, port: 9308, targetPort: metrics}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: statsd-mapping
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "statsd-exporter") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/monitoring/statsd/*").AsConfig | nindent 2 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: statsd-exporter
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "statsd-exporter") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "statsd-exporter") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "statsd-exporter") | nindent 8 }}
+      annotations:
+        checksum/mapping: {{ (.Files.Glob "files/monitoring/statsd/*").AsConfig | sha256sum }}
+    spec:
+      containers:
+        - name: statsd-exporter
+          image: {{ $m.statsdExporter.image }}
+          args:
+            - --statsd.mapping-config=/etc/statsd/mapping.yml
+            - --statsd.listen-udp=:9125
+            - --statsd.listen-tcp=
+            - --web.listen-address=:9102
+          ports:
+            - {name: statsd, containerPort: 9125, protocol: UDP}
+            - {name: metrics, containerPort: 9102}
+          readinessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            periodSeconds: 10
+          resources: {{- toYaml $m.statsdExporter.resources | nindent 12 }}
+          volumeMounts:
+            - {name: mapping, mountPath: /etc/statsd, readOnly: true}
+      volumes:
+        - name: mapping
+          configMap: {name: statsd-mapping}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: statsd-exporter
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "statsd-exporter") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "statsd-exporter") | nindent 4 }}
+  ports:
+    - {name: statsd, port: 9125, targetPort: statsd, protocol: UDP}
+    - {name: metrics, port: 9102, targetPort: metrics}
+{{- end }}

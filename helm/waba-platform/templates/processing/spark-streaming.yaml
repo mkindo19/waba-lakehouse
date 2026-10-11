@@ -49,6 +49,7 @@ spec:
       persistentVolumeClaim: {claimName: spark-checkpoints}
   driver:
     cores: {{ $.Values.spark.driver.cores }}
+    coreRequest: {{ $.Values.spark.driver.coreRequest | quote }}
     memory: {{ $.Values.spark.driver.memory | quote }}
     serviceAccount: spark
     labels: {{- include "waba.component" (dict "ctx" $ "name" $job.name) | nindent 6 }}
@@ -81,6 +82,7 @@ spec:
   executor:
     instances: {{ $.Values.spark.executor.instances }}
     cores: {{ $.Values.spark.executor.cores }}
+    coreRequest: {{ $.Values.spark.executor.coreRequest | quote }}
     memory: {{ $.Values.spark.executor.memory | quote }}
     labels: {{- include "waba.component" (dict "ctx" $ "name" (printf "%s-exec" $job.name)) | nindent 6 }}
     podSecurityContext: {fsGroup: 185}

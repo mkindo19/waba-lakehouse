@@ -1,0 +1,104 @@
+{{- if .Values.monitoring.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "monitoring") }}
+{{- $m := .Values.monitoring }}
+# =============================================================================
+# Grafana (énoncé 4.4) : tout est provisionné « as code » au démarrage — sources de données (Prometheus, Loki,
+# base Airflow en lecture seule), dashboard « WABA — santé des pipelines » et les 3 alertes.
+# Fichiers : monitoring/grafana/provisioning/*.yaml et monitoring/grafana/dashboards/*.json.
+# Pas de volume : l'état utile est dans le dépôt ; un redémarrage repart des fichiers.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "grafana") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/monitoring/grafana/provisioning/*").AsConfig | nindent 2 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "grafana") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/monitoring/grafana/dashboards/*.json").AsConfig | nindent 2 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "grafana") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "grafana") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "grafana") | nindent 8 }}
+      annotations:
+        checksum/provisioning: {{ (.Files.Glob "files/monitoring/grafana/provisioning/*").AsConfig | sha256sum }}
+        checksum/dashboards: {{ (.Files.Glob "files/monitoring/grafana/dashboards/*.json").AsConfig | sha256sum }}
+    spec:
+      enableServiceLinks: false        # pas de variables GRAFANA_PORT=tcp://... injectées (cf. Superset, D29)
+      containers:
+        - name: grafana
+          image: {{ $m.grafana.image }}
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: GRAFANA_ADMIN_USER}}
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: GRAFANA_ADMIN_PASSWORD}}
+            # lu par provisioning/datasources.yaml (${GRAFANA_DB_READER_PASSWORD})
+            - name: GRAFANA_DB_READER_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: GRAFANA_DB_READER_PASSWORD}}
+            - {name: GF_SERVER_ROOT_URL, value: "http://grafana.{{ .Values.ingress.domain }}:{{ .Values.ingress.port }}"}
+            - {name: GF_USERS_DEFAULT_LANGUAGE, value: fr-FR}
+            - {name: GF_USERS_ALLOW_SIGN_UP, value: "false"}
+            - {name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH, value: /etc/grafana/dashboards/pipeline-health.json}
+            - {name: GF_ANALYTICS_REPORTING_ENABLED, value: "false"}      # pas de télémétrie sortante
+            - {name: GF_ANALYTICS_CHECK_FOR_UPDATES, value: "false"}
+            - {name: GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES, value: "false"}
+            - {name: GF_NEWS_NEWS_FEED_ENABLED, value: "false"}
+          ports:
+            - {name: http, containerPort: 3000}
+          readinessProbe:
+            httpGet: {path: /api/health, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /api/health, port: http}
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources: {{- toYaml $m.grafana.resources | nindent 12 }}
+          volumeMounts:
+            - {name: provisioning, mountPath: /etc/grafana/provisioning, readOnly: true}
+            - {name: dashboards, mountPath: /etc/grafana/dashboards, readOnly: true}
+            - {name: data, mountPath: /var/lib/grafana}
+      volumes:
+        - name: provisioning           # un fichier par sous-dossier attendu par Grafana
+          configMap:
+            name: grafana-provisioning
+            items:
+              - {key: datasources.yaml, path: datasources/datasources.yaml}
+              - {key: dashboards.yaml, path: dashboards/dashboards.yaml}
+              - {key: alerting.yaml, path: alerting/alerting.yaml}
+        - name: dashboards
+          configMap: {name: grafana-dashboards}
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "grafana") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "grafana") | nindent 4 }}
+  ports:
+    - {name: http, port: 3000, targetPort: http}
+{{- end }}

@@ -1,0 +1,83 @@
+{{- if .Values.monitoring.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "monitoring") }}
+{{- $m := .Values.monitoring }}
+# =============================================================================
+# Loki (énoncé 4.4) : stockage des journaux de tous les pods (envoyés par Promtail). Un seul processus,
+# stockage sur PVC, rétention 7 jours. Configuration : monitoring/loki/loki.yaml.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "loki") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/monitoring/loki/*").AsConfig | nindent 2 }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: loki-data
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "loki") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.storageClass }}
+  resources: {requests: {storage: {{ $m.loki.storage }}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "loki") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "loki") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "loki") | nindent 8 }}
+      annotations:
+        checksum/config: {{ (.Files.Glob "files/monitoring/loki/*").AsConfig | sha256sum }}
+    spec:
+      initContainers:
+        - name: chown                  # l'image Loki tourne avec l'utilisateur 10001
+          image: {{ $m.initImage }}
+          command: [sh, -c, "chown -R 10001:10001 /loki"]
+          volumeMounts:
+            - {name: data, mountPath: /loki}
+      containers:
+        - name: loki
+          image: {{ $m.loki.image }}
+          args: [-config.file=/etc/loki/loki.yaml]
+          ports:
+            - {name: http, containerPort: 3100}
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml $m.loki.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/loki, readOnly: true}
+            - {name: data, mountPath: /loki}
+      volumes:
+        - name: config
+          configMap: {name: loki-config}
+        - name: data
+          persistentVolumeClaim: {claimName: loki-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "loki") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "loki") | nindent 4 }}
+  ports:
+    - {name: http, port: 3100, targetPort: http}
+{{- end }}

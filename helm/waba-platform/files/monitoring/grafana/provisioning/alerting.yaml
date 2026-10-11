@@ -1,0 +1,173 @@
+# Grafana WABA (niveau 4.4) — les 3 alertes de l'énoncé, gérées par Grafana (unified alerting) et provisionnées
+# « as code ». Chaque règle : A = requête, B = réduction à un nombre (dernière valeur), C = seuil (condition).
+# Les annotations __dashboardUid__ / __panelId__ affichent l'état de l'alerte sur le panneau du dashboard.
+# Démonstration du déclenchement : cf. docs/DECISIONS.md (D30) et Makefile (k8s-demo-*).
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: waba-pipelines
+    folder: WABA - alertes          # dossier distinct de celui du dashboard (« WABA ») : aucun conflit au provisioning
+    interval: 1m
+    rules:
+      # ------------------------------------------------------------------ 1. job Spark fraude en erreur > 5 min
+      # Le driver est scrapé par Prometheus (servlet Spark, port 4040) uniquement quand son pod est « Running » :
+      # job en échec (redémarrages en boucle), supprimé ou bloqué -> aucune cible saine -> 0.
+      - uid: waba-fraud-job-down
+        title: Job Spark fraude/AML en erreur depuis plus de 5 min
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: sum(up{app="stream-fraud-aml", spark_role="driver"}) or vector(0)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: lt, params: [1]}
+                  operator: {type: and}
+                  query: {params: [C]}
+                  reducer: {type: last, params: []}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: Le job streaming stream-fraud-aml ne tourne plus (driver absent ou en échec).
+          description: >-
+            Aucun driver sain depuis plus de 5 minutes : la détection de fraude, d'AML et de liquidité est
+            arrêtée. Diagnostic : kubectl get sparkapp stream-fraud-aml -n processing ; journaux dans Grafana
+            (panneau « Journaux Spark ERROR / WARNING »).
+          __dashboardUid__: waba-pipeline-health
+          __panelId__: "2"
+        labels: {severity: critical, domaine: fraude}
+        isPaused: false
+
+      # ------------------------------------------------------------------ 2. retard du consommateur AML > 5000
+      # Groupe « waba-spark.fraud_aml_aml » : offsets committés par StreamMonitor (spark/jobs/common/stream_monitor.py)
+      # après chaque micro-lot de la requête AML. Job arrêté -> offsets figés -> le retard grandit avec le topic.
+      - uid: waba-aml-consumer-lag
+        title: Retard du consommateur AML supérieur à 5000 messages
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: max(kafka_consumergroup_lag_sum{consumergroup="waba-spark.fraud_aml_aml"}) or vector(0)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [5000]}
+                  operator: {type: and}
+                  query: {params: [C]}
+                  reducer: {type: last, params: []}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        annotations:
+          summary: "Le contrôle AML a plus de 5000 transactions de retard (silver-bank-transactions)."
+          description: >-
+            Les transactions bancaires s'accumulent sans être contrôlées (seuil AML 10 M XOF). Vérifier le job
+            stream-fraud-aml (état, mémoire) et le débit d'entrée (panneau « Kafka : retard des consommateurs »).
+          __dashboardUid__: waba-pipeline-health
+          __panelId__: "3"
+        labels: {severity: critical, domaine: aml}
+        isPaused: false
+
+      # ------------------------------------------------------------------ 3. rapport réglementaire absent à J+1 06h00 UTC
+      # Lu directement dans la base Airflow (rôle lecture seule) : exact et sans dépendre de compteurs StatsD
+      # (un compteur Prometheus ne voit pas sa première incrémentation, ni un DAG qui n'a jamais tourné).
+      # 1 = pas de run réussi du rapport de la veille ET (il est 06h00 UTC passées OU le run a déjà échoué).
+      - uid: waba-regulatory-report-missing
+        title: Rapport réglementaire J-1 non produit à 06h00 UTC
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: airflow-db
+            model:
+              refId: A
+              datasource: {type: grafana-postgresql-datasource, uid: airflow-db}
+              editorMode: code
+              format: time_series
+              rawQuery: true
+              rawSql: |-
+                WITH clock AS (SELECT (now() AT TIME ZONE 'UTC') AS now_utc),
+                runs AS (
+                  SELECT r.state FROM dag_run r, clock c
+                  WHERE r.dag_id = 'dag_regulatory_report'
+                    AND (r.data_interval_start AT TIME ZONE 'UTC')::date = c.now_utc::date - 1
+                )
+                SELECT now() AS time,
+                  CASE
+                    WHEN EXISTS (SELECT 1 FROM runs WHERE state = 'success') THEN 0
+                    WHEN (SELECT EXTRACT(HOUR FROM now_utc) FROM clock) >= 6 THEN 1
+                    WHEN EXISTS (SELECT 1 FROM runs WHERE state = 'failed') THEN 1
+                    ELSE 0
+                  END AS rapport_j1_manquant
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+                  operator: {type: and}
+                  query: {params: [C]}
+                  reducer: {type: last, params: []}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 0s
+        annotations:
+          summary: Le rapport réglementaire BCEAO / CIMA de la veille n'est pas disponible (SLA J+1 06h00 UTC).
+          description: >-
+            dag_regulatory_report n'a pas de run réussi pour la veille. Consulter le run dans Airflow
+            (http://airflow.localtest.me:8090), corriger puis relancer : make k8s-dag DAG=dag_regulatory_report.
+          __dashboardUid__: waba-pipeline-health
+          __panelId__: "5"
+        labels: {severity: critical, domaine: reglementaire}
+        isPaused: false

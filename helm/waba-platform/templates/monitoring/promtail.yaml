@@ -1,0 +1,90 @@
+{{- if .Values.monitoring.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "monitoring") }}
+{{- $m := .Values.monitoring }}
+# =============================================================================
+# Promtail (énoncé 4.4) : un agent par nœud (DaemonSet) qui lit les fichiers de journaux des conteneurs
+# (/var/log/pods) et les envoie à Loki, avec les étiquettes du pod. Journaux JSON des jobs Spark analysés
+# (niveau, logger, horodatage). Configuration : monitoring/promtail/promtail.yaml.
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: promtail
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "promtail") | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: waba-promtail
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "promtail") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods, nodes]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: waba-promtail
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "promtail") | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: waba-promtail}
+subjects:
+  - {kind: ServiceAccount, name: promtail, namespace: {{ $ns }}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "promtail") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/monitoring/promtail/*").AsConfig | nindent 2 }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "promtail") | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "promtail") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "promtail") | nindent 8 }}
+      annotations:
+        checksum/config: {{ (.Files.Glob "files/monitoring/promtail/*").AsConfig | sha256sum }}
+    spec:
+      serviceAccountName: promtail
+      containers:
+        - name: promtail
+          image: {{ $m.promtail.image }}
+          args: [-config.file=/etc/promtail/promtail.yaml]
+          env:
+            - name: HOSTNAME             # ne garde que les pods de CE nœud (relabel __host__)
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          ports:
+            - {name: http, containerPort: 9080}
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            periodSeconds: 10
+          securityContext:
+            runAsUser: 0                 # lecture des journaux du nœud (propriété de root)
+          resources: {{- toYaml $m.promtail.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/promtail, readOnly: true}
+            - {name: positions, mountPath: /run/promtail}
+            - {name: pods, mountPath: /var/log/pods, readOnly: true}
+            # runtime docker (minikube --driver=docker) : les fichiers de /var/log/pods sont des liens vers ici
+            - {name: docker-containers, mountPath: /var/lib/docker/containers, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: promtail-config}
+        - name: positions                # position de lecture de chaque fichier : pas de doublon au redémarrage
+          hostPath: {path: /var/lib/waba-promtail, type: DirectoryOrCreate}
+        - name: pods
+          hostPath: {path: /var/log/pods}
+        - name: docker-containers
+          hostPath: {path: /var/lib/docker/containers, type: DirectoryOrCreate}
+{{- end }}

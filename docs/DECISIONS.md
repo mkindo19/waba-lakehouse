@@ -360,3 +360,85 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
   `<NOM>_PORT=tcp://IP:port`. Le Service s'appelant `superset`, le pod recevait `SUPERSET_PORT=tcp://…:8088`, que le
   script de démarrage de l'image utilise comme port d'écoute -> crash (« 'tcp' is not a valid port number »).
   Correctif : `enableServiceLinks: false` (la découverte passe par le DNS) et `SUPERSET_PORT=8088` explicite.
+- **Limite connue de la World Map** (plugin « legacy » de Superset 4.1) : l'infobulle n'apparaît que sur les pays qui
+  ont des données, et la couleur de survol peut rester affichée après le passage de la souris (rafraîchir avec F5).
+  Comportement du plugin, sans impact sur les données ; alternative si gênant : graphique en barres par pays.
+
+## D30 — Observabilité : Prometheus, Loki, Grafana (« santé des pipelines » + 3 alertes)
+- **Composants** (namespace `monitoring`, images épinglées) : Prometheus 3.1 (PVC, 7 jours), Loki 3.3 (PVC, 7 jours),
+  Promtail (DaemonSet : un agent par nœud), Grafana 11.3, `kafka-exporter`, `statsd-exporter`. Pas de chart
+  kube-prometheus-stack : une dizaine de composants et d'opérateurs de plus que nécessaire sur un minikube de 24 Go,
+  et des configurations moins lisibles. Configurations dans `monitoring/` (validées localement : `promtool`,
+  `loki -verify-config`, `promtail -dry-run` sur des journaux réels aux formats docker et CRI).
+- **Une source de métrique par composant** : Spark = servlet Prometheus du driver (port 4040, pods annotés
+  `prometheus.io/*`, étiquettes `app`, `spark_role`, `dag_id`, `country_code`) ; Kafka = `kafka-exporter` ; NiFi =
+  point natif `/nifi-api/flow/metrics/prometheus` ; Airflow = StatsD -> `statsd-exporter` (règles de nommage
+  `monitoring/statsd/mapping.yml` : `airflow_ti_finish{dag_id, task_id, state}`) ; Trino = `/metrics` (OpenMetrics,
+  en-tête `X-Trino-User`).
+- **Retard (lag) des jobs Spark** : Spark ne committe jamais ses offsets dans Kafka (il les garde dans ses
+  checkpoints), donc aucun outil Kafka ne voit son retard. `StreamMonitor` (StreamingQueryListener,
+  `spark/jobs/common/stream_monitor.py`) committe après chaque micro-lot les offsets traités dans un groupe
+  `waba-spark.<requête>` (AdminClient Kafka de la JVM, via py4j : aucune dépendance ajoutée). Ce groupe ne sert qu'à
+  la supervision ; la reprise reste fondée sur les checkpoints. Atout décisif pour l'alerte : si le job tombe, les
+  offsets se figent et le retard continue de grandir (une métrique exposée par le job disparaîtrait avec lui). Le
+  commit est protégé (try/except) : un échec de supervision ne peut pas arrêter le traitement.
+- **Latence par pays** : le job 1 écrit pour chaque micro-lot une ligne JSON « latence par pays » (âge du message le
+  plus ancien du pays entre son dépôt dans Kafka et la fin de l'écriture silver). Grafana la lit dans Loki
+  (`| json | unwrap lag_s`) : pas d'étiquette Prometheus par pays à maintenir dans le code, et l'historique est gardé
+  avec les journaux. Promtail extrait `level` et `logger` des lignes JSON des jobs Spark (filtre ERROR / WARNING).
+- **Formats de journaux** : minikube `--driver=docker` utilise le runtime docker (fichiers JSON, liens symboliques de
+  `/var/log/pods` vers `/var/lib/docker/containers`) ; containerd / CRI-O écrivent au format CRI. Promtail enchaîne
+  les étapes `docker` puis `cri` (chacune ignore les lignes qui ne sont pas à son format) et monte les deux dossiers :
+  la même configuration fonctionne sur les deux runtimes (vérifié en local).
+- **Les 3 alertes** (Grafana unified alerting, `monitoring/grafana/provisioning/alerting.yaml`, évaluées chaque minute) :
+  1. *Job fraude en erreur > 5 min* : `sum(up{app="stream-fraud-aml", spark_role="driver"}) or vector(0) < 1` pendant
+     5 min. Le driver n'est scrapé que s'il est « Running » : échec, redémarrages en boucle ou suppression -> 0.
+  2. *Retard AML > 5000* : `kafka_consumergroup_lag_sum{consumergroup="waba-spark.fraud_aml_aml"} > 5000` pendant 1 min.
+  3. *Rapport réglementaire absent à J+1 06h00 UTC* : requête SQL sur la base Airflow — aucun run réussi de
+     `dag_regulatory_report` pour la veille ET (06h00 UTC passées OU run déjà en échec). Écarté : les compteurs StatsD
+     (un compteur Prometheus ne voit pas sa première incrémentation, ni un DAG qui n'a pas tourné du tout — or
+     l'absence de run est justement le cas à détecter). Moindre privilège : Grafana se connecte avec un rôle
+     PostgreSQL `grafana_reader` limité à `SELECT` sur `dag_run`, créé par l'init du scheduler (mot de passe dans
+     `.env` / `waba-secrets`, jamais en clair).
+  Requête SQL testée sur PostgreSQL 16 avec 7 cas (pas de run avant / après 06h, échec, en cours, succès, succès
+  d'un autre jour, fuseau de session non UTC).
+- **Dashboard « as code »** : `monitoring/grafana/build_dashboard.py` génère `dashboards/pipeline-health.json`
+  (18 panneaux, uid `waba-pipeline-health`, page d'accueil de Grafana). Les 4 vues de l'énoncé : latence Spark par
+  pays, retard des consommateurs du job fraude (ligne de seuil 5000), débit NiFi (FlowFiles/s par processeur +
+  messages/s dans les topics raw-*), taux d'erreur des DAGs ; plus une ligne de synthèse (état de chaque alerte),
+  les derniers DAG runs, les journaux Spark ERROR/WARNING et l'état de la collecte. Les alertes sont rattachées à
+  leurs panneaux (`__dashboardUid__`/`__panelId__`) : leur état s'affiche sur le dashboard.
+- **Notification** : aucun canal configuré (pas de SMTP / Teams en local) ; l'état et l'historique des alertes sont
+  visibles dans Grafana (Alerting > Alert rules). Production : point de contact Teams / PagerDuty / e-mail, routage
+  par l'étiquette `domaine` (fraude, aml, reglementaire).
+- **Démonstration** (alertes réellement déclenchées, pas simulées) : job fraude cassé volontairement
+  (`make k8s-demo-break` : fichier principal inexistant) + flux de transactions (`make k8s-stream`) -> alerte 2
+  (retard) puis alerte 1 (5 min) ; `make k8s-install` rétablit le job, le retard est rattrapé et les alertes se
+  résolvent. Alerte 3 : le DAG réglementaire étant en pause, elle se déclenche après 06h00 UTC ; `make k8s-dag
+  DAG=dag_regulatory_report` produit le rapport et la résout.
+- **Limite constatée en démo** : le groupe `waba-spark.<requête>` n'existe qu'après le premier micro-lot traité par
+  la requête (Spark ne signale une progression que s'il y a des données). Un job cassé avant d'avoir traité un seul
+  lot n'a donc pas encore de groupe : retard invisible (0), seule l'alerte 1 se déclenche. En régime normal, le
+  groupe existe dès la première donnée et Kafka conserve ses offsets 7 jours sans commit (`offsets.retention.minutes`) ;
+  au-delà, l'alerte 1 (job arrêté) est de toute façon active.
+- **Réservations CPU** (vécu) : Spark réserve par défaut autant de CPU que de cœurs (`cores`). Avec la supervision
+  (+0,4 CPU réservé), le nœud atteignait 90 % de CPU réservé pour 13 % réellement consommé : l'executor du job fraude
+  et celui d'un job batch restaient `Pending`. Correctif : `coreRequest` (réservation) distinct de `cores`
+  (parallélisme) — drivers 250m, executors streaming 500m, executor batch 1 CPU.
+
+## D31 — Catalogue Iceberg sur PostgreSQL (Kubernetes)
+- **Constat (vécu, démo 4.4)** : le batch `dag_ingest_raw` (déclenché par les fichiers de la démo) et le job
+  streaming 1 committaient en même temps ; le catalogue REST sur SQLite répondait 500
+  (`SQLITE_BUSY_SNAPSHOT : database is locked`). En mode WAL, ce cas (une transaction de lecture qui veut écrire
+  alors qu'un autre écrivain est passé entre-temps) n'est pas couvert par `busy_timeout` (D22) : échec immédiat.
+  Conséquences visibles dans Grafana : runs `dag_ingest_raw` en échec (taux d'erreur 27 %), requête du job 1
+  arrêtée, plus aucune donnée silver -> le retard AML ne pouvait plus monter. La supervision a fait son travail.
+- **Correctif** : base du catalogue JDBC sur **PostgreSQL** (`iceberg-catalog-db`, PVC `keep`, mot de passe dans
+  `waba-secrets`) : écritures concurrentes gérées par verrous de ligne, c'est la configuration de production
+  annoncée en D22. Le serveur REST et les clients (Spark, Trino) sont inchangés.
+- **Migration sans perte** : un initContainer (`infra/iceberg/migrate_catalog.py`) crée les tables du catalogue
+  JDBC (schéma V1 d'Iceberg 1.6) et y recopie les lignes de l'ancien SQLite. Une table Iceberg n'est dans le
+  catalogue qu'un pointeur vers son fichier de métadonnées dans MinIO : rien n'est réécrit ni réenregistré.
+  Idempotent ; le fichier SQLite est conservé (retour arrière). Testé sur PostgreSQL 16 (2 passages ; un bug de
+  lecture des colonnes trouvé et corrigé grâce au test).
+- **Niveaux 1-3 (docker compose)** : SQLite conservé (un seul poste, charge faible).

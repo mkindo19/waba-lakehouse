@@ -1,6 +1,81 @@
 {{- if .Values.icebergRest.enabled }}
 {{- $ns := include "waba.ns" (dict "ctx" $ "domain" "processing") }}
-# Catalogue Iceberg REST (tables raw/bronze/silver/gold), base SQLite sur PVC (cf. D6, D22).
+# Catalogue Iceberg REST (tables raw/bronze/silver/gold). Base du catalogue : PostgreSQL (D31) ; l'ancien fichier
+# SQLite (D6, D22) reste sur son PVC, lu une seule fois par la migration au premier démarrage.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  annotations:
+    helm.sh/resource-policy: keep
+  name: iceberg-catalog-db-data
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "iceberg-catalog-db") | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.storageClass }}
+  resources: {requests: {storage: {{ .Values.icebergRest.db.storage }}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iceberg-catalog-db
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "iceberg-catalog-db") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "iceberg-catalog-db") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "iceberg-catalog-db") | nindent 8 }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.icebergRest.db.image }}
+          env:
+            - {name: POSTGRES_USER, value: iceberg}
+            - {name: POSTGRES_DB, value: iceberg}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: ICEBERG_CATALOG_DB_PASSWORD}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, iceberg, -d, iceberg]}
+            periodSeconds: 10
+          livenessProbe:
+            exec: {command: [pg_isready, -U, iceberg, -d, iceberg]}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources: {{- toYaml .Values.icebergRest.db.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: iceberg-catalog-db-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iceberg-catalog-db
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "iceberg-catalog-db") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "iceberg-catalog-db") | nindent 4 }}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iceberg-catalog-migration
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "iceberg-rest") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/iceberg/*").AsConfig | nindent 2 }}
+---
+# Ancien catalogue SQLite (conservé : source de la migration, retour arrière possible)
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -21,7 +96,7 @@ metadata:
   namespace: {{ $ns }}
   labels: {{- include "waba.component" (dict "ctx" $ "name" "iceberg-rest") | nindent 4 }}
 spec:
-  replicas: 1                          # SQLite : un seul écrivain possible
+  replicas: 1
   strategy: {type: Recreate}
   selector:
     matchLabels: {{- include "waba.selector" (dict "name" "iceberg-rest") | nindent 6 }}
@@ -30,7 +105,22 @@ spec:
       labels: {{- include "waba.component" (dict "ctx" $ "name" "iceberg-rest") | nindent 8 }}
     spec:
       securityContext:
-        runAsUser: 0                   # écriture du fichier SQLite sur le volume (dev local, cf. D6)
+        runAsUser: 0                   # lecture / verrou du fichier SQLite hérité sur le volume (cf. D6)
+      initContainers:
+        # SQLite -> PostgreSQL, une seule fois (idempotent). Image waba/airflow : Python + sqlite3 + psycopg2 déjà
+        # présents et chargés dans minikube (aucun téléchargement).
+        - name: migrate-catalog
+          image: "{{ .Values.airflow.image }}:{{ .Values.localImages.tag }}"
+          imagePullPolicy: {{ .Values.localImages.pullPolicy }}
+          command: [python, /migration/migrate_catalog.py]
+          env:
+            # paquets de l'image Airflow installés pour l'utilisateur « airflow » ; ce conteneur tourne en root
+            - {name: PYTHONPATH, value: /home/airflow/.local/lib/python3.10/site-packages}
+            - name: ICEBERG_CATALOG_DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: ICEBERG_CATALOG_DB_PASSWORD}}
+          volumeMounts:
+            - {name: catalog, mountPath: /catalog}
+            - {name: migration, mountPath: /migration, readOnly: true}
       containers:
         - name: iceberg-rest
           image: {{ .Values.icebergRest.image }}
@@ -41,8 +131,12 @@ spec:
             - name: CATALOG_S3_ENDPOINT
               value: {{ include "waba.s3Endpoint" $ | quote }}
             - {name: CATALOG_S3_PATH__STYLE__ACCESS, value: "true"}
-            - name: CATALOG_URI
-              value: "jdbc:sqlite:file:/catalog/iceberg_catalog.db?journal_mode=WAL&busy_timeout=30000"
+            # Catalogue JDBC sur PostgreSQL : écritures concurrentes sûres (verrous par ligne), fini SQLITE_BUSY (D31).
+            # CATALOG_JDBC_USER / _PASSWORD -> propriétés jdbc.user / jdbc.password du catalogue.
+            - {name: CATALOG_URI, value: "jdbc:postgresql://iceberg-catalog-db:5432/iceberg"}
+            - {name: CATALOG_JDBC_USER, value: iceberg}
+            - name: CATALOG_JDBC_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: ICEBERG_CATALOG_DB_PASSWORD}}
           ports:
             - {name: http, containerPort: 8181}
           readinessProbe:
@@ -58,6 +152,8 @@ spec:
       volumes:
         - name: catalog
           persistentVolumeClaim: {claimName: iceberg-catalog}
+        - name: migration
+          configMap: {name: iceberg-catalog-migration}
 ---
 apiVersion: v1
 kind: Service
