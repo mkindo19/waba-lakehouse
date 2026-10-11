@@ -327,3 +327,36 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
   ingest -> silver -> gold ; `dag_regulatory_report` est activé séparément (alerte J+1 06:00, 4.4).
 - **Job 2 (fraude/AML)** activé une fois `silver.customers` / `silver.accounts` produits par les DAGs ; avant, ses
   référentiels n'existent pas et la SparkApplication échouerait en boucle (`restartPolicy: Always`).
+
+## D29 — Superset : 3 dashboards « as code » sur Trino
+- **Déploiement** (namespace `serving`) : image `waba/superset` = image officielle 4.1.1 + pilote `trino[sqlalchemy]`
+  + Authlib (SSO Keycloak, 4.3) ; base de métadonnées PostgreSQL sur PVC (`keep`) ; secrets (clé de session, mots de
+  passe) dans `waba-secrets`. Connexion SQLAlchemy : `trino://superset@trino.serving.svc.cluster.local:8080/iceberg`.
+- **Dashboards as code** : `superset/dashboards/build_assets.py` décrit en Python les jeux de données, les 12
+  graphiques et les 3 dashboards, et produit le ZIP au format d'import v1 de Superset. Identifiants stables (uuid5) :
+  un ré-import met à jour au lieu de dupliquer. Le script est monté par ConfigMap et exécuté au démarrage du pod :
+  modifier un graphique = modifier le fichier puis `make k8s-install` (pas de clic dans l'interface, rien à perdre).
+- **Import en écrasement** (vécu, en test local) : `superset import-dashboards` n'écrase que les dashboards ; les
+  graphiques et jeux de données déjà présents ne sont jamais mis à jour. `import_assets.py` utilise la commande de
+  l'API `/api/v1/assets/import` (`ImportAssetsCommand`), qui écrase tout.
+- **Jeux de données** : tables gold quand le KPI existe (ARPC, loss ratio, délais sinistres, corridors) ; requêtes SQL
+  (jeux « virtuels ») pour les vues qui combinent plusieurs tables : revenu par métier (commissions + intérêts +
+  primes + frais mobile money), top 10 produits par pays (`ROW_NUMBER`), dernier NPL par pays et sa classe de risque,
+  alertes AML (batch silver + temps réel `gold.rt_aml_events`). Toutes ont une colonne `country_code` : le filtre
+  natif « Pays » de chaque dashboard s'applique à tous ses graphiques (vérifié avec plusieurs jeux de données).
+- **Seuils réglementaires visibles** : NPL coloré par classe (vert < 3 %, orange 3-5 %, rouge > 5 % BCEAO, couleurs
+  fixées dans le dashboard) ; loss ratio en barres + ligne du seuil CIMA 70 % (graphique mixte) ; délai des
+  sinistres en barres + ligne du SLA par branche (IARD 30 j, VIE 45 j).
+- **Carte** : Superset ne fournit pas de fond « Afrique de l'Ouest » (cartes par pays seulement) ; la World Map
+  (codes ISO-2) colore les 8 pays. Alternative écartée : deck.gl + GeoJSON maison (fond de carte Mapbox requis).
+- **Validation avant livraison** : Superset 4.1.1 lancé localement sur DuckDB (mêmes schémas `silver`/`gold`, données
+  factices), import du paquet puis rendu des 3 dashboards dans Chromium (Playwright) : aucun graphique en erreur,
+  filtre Pays appliqué partout. Correctifs issus de ce test : heure 0 affichée « <NULL> » par la heatmap (libellé
+  « 00h ».. « 23h »), mode d'import en écrasement.
+- **Pilote PostgreSQL** (vécu, au premier déploiement) : l'image officielle 4.1 « lean » ne contient aucun pilote de
+  base, pas même `psycopg2` pour sa propre base de métadonnées (`ModuleNotFoundError`, initContainer en boucle). Le
+  test local utilisait SQLite et ne pouvait pas le révéler : `psycopg2-binary` est ajouté à l'image `waba/superset`.
+- **Liens de service Kubernetes** (vécu) : pour chaque Service du namespace, Kubernetes injecte des variables
+  `<NOM>_PORT=tcp://IP:port`. Le Service s'appelant `superset`, le pod recevait `SUPERSET_PORT=tcp://…:8088`, que le
+  script de démarrage de l'image utilise comme port d'écoute -> crash (« 'tcp' is not a valid port number »).
+  Correctif : `enableServiceLinks: false` (la découverte passe par le DNS) et `SUPERSET_PORT=8088` explicite.

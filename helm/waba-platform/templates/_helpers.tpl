@@ -167,3 +167,27 @@ spec:
 - {name: WABA_SPARK_APP_TEMPLATE, value: /opt/airflow/spark-k8s/sparkapplication.yaml}
 {{ include "waba.s3Env" . }}
 {{- end -}}
+
+{{/* Superset : URI SQLAlchemy de Trino, variables d'environnement et volumes communs (init + serveur) */}}
+{{- define "waba.supersetTrinoUri" -}}
+trino://{{ .Values.superset.trinoUser }}@{{ include "waba.svc" (dict "ctx" . "domain" "serving" "name" "trino") }}:8080/iceberg
+{{- end -}}
+
+{{- define "waba.supersetEnv" -}}
+- name: SUPERSET_SECRET_KEY
+  valueFrom: {secretKeyRef: {name: waba-secrets, key: SUPERSET_SECRET_KEY}}
+- name: SUPERSET_DB_PASSWORD
+  valueFrom: {secretKeyRef: {name: waba-secrets, key: SUPERSET_DB_PASSWORD}}
+- name: SUPERSET_ADMIN_USER
+  valueFrom: {secretKeyRef: {name: waba-secrets, key: SUPERSET_ADMIN_USER}}
+- name: SUPERSET_ADMIN_PASSWORD
+  valueFrom: {secretKeyRef: {name: waba-secrets, key: SUPERSET_ADMIN_PASSWORD}}
+- {name: WABA_TRINO_URI, value: {{ include "waba.supersetTrinoUri" . | quote }}}
+- {name: SCARF_ANALYTICS, value: "false"}      # pas de télémétrie sortante
+- {name: SUPERSET_PORT, value: "8088"}          # port d'écoute de gunicorn (cf. enableServiceLinks)
+{{- end -}}
+
+{{- define "waba.supersetMounts" -}}
+- {name: files, mountPath: /app/waba, readOnly: true}
+- {name: files, mountPath: /app/pythonpath/superset_config.py, subPath: superset_config.py, readOnly: true}
+{{- end -}}

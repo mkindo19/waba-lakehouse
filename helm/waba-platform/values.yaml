@@ -27,6 +27,7 @@ ingress:
     - {host: nifi, component: nifi, domain: ingestion, service: nifi, port: 8080}
     - {host: trino, component: trino, domain: serving, service: trino, port: 8080}
     - {host: airflow, component: airflow, domain: processing, service: airflow-webserver, port: 8080}
+    - {host: superset, component: superset, domain: serving, service: superset, port: 8088}
 
 storageClass: standard        # provisionneur minikube (hostPath)
 
@@ -46,7 +47,8 @@ secretKeys:
   processing: [MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, WABA_S3_ACCESS_KEY, WABA_S3_SECRET_KEY, PII_HASH_SALT,
                AIRFLOW_DB_PASSWORD, AIRFLOW_FERNET_KEY, AIRFLOW_WEBSERVER_SECRET_KEY,
                AIRFLOW_ADMIN_USER, AIRFLOW_ADMIN_PASSWORD]
-  serving: [WABA_S3_ACCESS_KEY, WABA_S3_SECRET_KEY]
+  serving: [WABA_S3_ACCESS_KEY, WABA_S3_SECRET_KEY,
+            SUPERSET_SECRET_KEY, SUPERSET_DB_PASSWORD, SUPERSET_ADMIN_USER, SUPERSET_ADMIN_PASSWORD]
   governance: []
   monitoring: []
 
@@ -114,6 +116,21 @@ trino:
   resources:
     requests: {cpu: 250m, memory: 2Gi}
     limits: {memory: 2560Mi}
+
+# Superset : dashboards sur Trino (énoncé 4.2). Dashboards « as code » : superset/dashboards/build_assets.py
+superset:
+  enabled: true
+  image: waba/superset       # image officielle + pilote Trino + Authlib (cf. superset/Dockerfile)
+  trinoUser: superset        # utilisateur Trino de la connexion (SSO Keycloak en 4.3)
+  db:
+    image: postgres:16-alpine
+    storage: 1Gi
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {memory: 512Mi}
+  resources:
+    requests: {cpu: 200m, memory: 768Mi}
+    limits: {memory: 1536Mi}
 
 # ----------------------------------------------------------------------------- Spark sur Kubernetes
 # Spark Operator (sous-chart) : surveille le namespace processing et y lance les SparkApplication.

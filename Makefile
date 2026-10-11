@@ -5,7 +5,7 @@ SPARK_SUBMIT := $(COMPOSE) exec -T spark-master /opt/spark/bin/spark-submit --ma
 DATASET ?= all
 COUNTRY ?=
 
-.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3 k8s-files k8s-secrets k8s-install k8s-status k8s-expose k8s-uninstall k8s-lint k8s-images k8s-referentials k8s-stream k8s-trino k8s-deps k8s-crds k8s-spark k8s-spark-logs k8s-generate k8s-dag k8s-dag-runs k8s-dags-on k8s-alert-test k8s-gold-peek
+.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3 k8s-files k8s-secrets k8s-install k8s-status k8s-expose k8s-uninstall k8s-lint k8s-images k8s-referentials k8s-stream k8s-trino k8s-deps k8s-crds k8s-spark k8s-spark-logs k8s-generate k8s-dag k8s-dag-runs k8s-dags-on k8s-alert-test k8s-gold-peek k8s-deps-update k8s-start
 
 help:                ## Liste des commandes
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -65,7 +65,7 @@ test-spark:          ## Tests des transformations Spark (nécessite Java + pyspa
 	cd spark && python -m pytest -q tests
 
 lint:                ## Vérification PEP 8 (ruff)
-	ruff check generator spark airflow
+	ruff check generator spark airflow superset
 
 # ----------------------------------------------------------------------------- niveau 3 : streaming
 KAFKA_EXEC := $(COMPOSE) exec -T kafka /opt/kafka/bin
@@ -147,12 +147,13 @@ K8S_HTTP_PORT ?= 8090
 HELM_CHART := helm/waba-platform
 
 k8s-files:           ## [N4] Copie les scripts de infra/ dans le chart (Helm ne lit que les fichiers du chart)
-	@mkdir -p $(HELM_CHART)/files/minio $(HELM_CHART)/files/kafka $(HELM_CHART)/files/nifi $(HELM_CHART)/files/trino-kafka $(HELM_CHART)/files/airflow-dags
+	@mkdir -p $(HELM_CHART)/files/minio $(HELM_CHART)/files/kafka $(HELM_CHART)/files/nifi $(HELM_CHART)/files/trino-kafka $(HELM_CHART)/files/airflow-dags $(HELM_CHART)/files/superset
 	@cp infra/minio/init.sh $(HELM_CHART)/files/minio/init.sh
 	@cp infra/kafka/create-topics.sh $(HELM_CHART)/files/kafka/create-topics.sh
 	@cp infra/nifi/deploy_flow.py $(HELM_CHART)/files/nifi/deploy_flow.py
 	@cp trino/kafka/*.json $(HELM_CHART)/files/trino-kafka/
 	@rm -f $(HELM_CHART)/files/airflow-dags/*.py && cp airflow/dags/*.py $(HELM_CHART)/files/airflow-dags/
+	@cp superset/superset_config.py superset/dashboards/build_assets.py superset/dashboards/import_assets.py $(HELM_CHART)/files/superset/
 
 k8s-secrets: env     ## [N4] Génère helm/values-secrets.yaml depuis .env (ignoré par git)
 	@python3 scripts/k8s_values_secrets.py
@@ -161,7 +162,14 @@ k8s-lint: k8s-files k8s-secrets k8s-crds   ## [N4] Vérifie le chart (syntaxe + 
 	helm lint $(HELM_CHART) -f helm/values-secrets.yaml
 	helm template $(K8S_RELEASE) $(HELM_CHART) -n $(K8S_NS) -f helm/values-secrets.yaml | kubectl create --dry-run=client -o name -f - >/dev/null && echo "rendu OK : manifestes valides"
 
-k8s-deps:            ## [N4] Télécharge les dépendances du chart (Spark Operator) dans helm/waba-platform/charts/
+# Téléchargé une seule fois : une installation ne dépend pas d'Internet si l'archive est déjà là (vécu : coupure DNS
+# sous WSL -> make k8s-install bloqué). Forcer la mise à jour : make k8s-deps-update.
+k8s-deps:            ## [N4] Dépendances du chart (Spark Operator) dans helm/waba-platform/charts/ (si absentes)
+	@if ls $(HELM_CHART)/charts/spark-operator-*.tgz >/dev/null 2>&1; then \
+	  echo "Spark Operator déjà présent : $$(ls $(HELM_CHART)/charts/)"; \
+	else $(MAKE) --no-print-directory k8s-deps-update; fi
+
+k8s-deps-update:     ## [N4] Retélécharge les dépendances du chart (Internet requis)
 	@helm repo add spark-operator https://kubeflow.github.io/spark-operator >/dev/null 2>&1 || true
 	helm dependency build $(HELM_CHART) || helm dependency update $(HELM_CHART)
 
@@ -174,9 +182,10 @@ k8s-install: k8s-files k8s-secrets k8s-crds   ## [N4] Installe / met à jour TOU
 	helm upgrade --install $(K8S_RELEASE) $(HELM_CHART) -n $(K8S_NS) --create-namespace \
 	  -f helm/values-secrets.yaml --wait --timeout 20m
 
-LOCAL_IMAGES := waba/generator:$(or $(WABA_VERSION),dev) waba/spark:$(or $(WABA_VERSION),dev) waba/airflow:$(or $(WABA_VERSION),dev)
+LOCAL_IMAGES := waba/generator:$(or $(WABA_VERSION),dev) waba/spark:$(or $(WABA_VERSION),dev) waba/airflow:$(or $(WABA_VERSION),dev) waba/superset:$(or $(WABA_VERSION),dev)
 k8s-images:          ## [N4] Construit les images maison (docker compose) et les charge dans minikube (~5 min)
 	$(COMPOSE) build generator spark-master airflow-scheduler
+	docker build -t waba/superset:$(or $(WABA_VERSION),dev) superset
 	@for img in $(LOCAL_IMAGES); do echo "-> minikube image load $$img"; minikube image load $$img || exit 1; done
 	@minikube image ls | grep waba/
 
@@ -226,13 +235,17 @@ APP ?= stream-raw-to-silver
 k8s-spark-logs:      ## [N4] Journaux du driver d'une application Spark (APP=stream-raw-to-silver)
 	kubectl logs -n processing -f --tail=40 $$(kubectl get pods -n processing -l spark-role=driver,app.kubernetes.io/name=$(APP) -o name | tail -1)
 
+k8s-start:           ## [N4] Redémarre le cluster minikube existant (après arrêt / redémarrage de WSL)
+	minikube start --force        # --force : pilote docker utilisé en root (cf. D26)
+	kubectl get nodes
+
 k8s-status:          ## [N4] Pods, volumes et URL de la plateforme
 	@kubectl get pods -A -l app.kubernetes.io/part-of=waba-platform -o wide
 	@echo; kubectl get pvc -A
 	@echo; kubectl get ingress -A -o custom-columns=NAMESPACE:.metadata.namespace,URL:.spec.rules[0].host
 
 k8s-expose:          ## [N4] Rend les interfaces accessibles depuis Windows : http://<ui>.localtest.me (laisser tourner)
-	@echo "Interfaces (port $(K8S_HTTP_PORT)) : kafka-ui, minio, generator, nifi/nifi, trino, airflow  ->  http://<nom>.localtest.me:$(K8S_HTTP_PORT)   (Ctrl+C pour arrêter)"
+	@echo "Interfaces (port $(K8S_HTTP_PORT)) : kafka-ui, minio, generator, nifi/nifi, trino, airflow, superset  ->  http://<nom>.localtest.me:$(K8S_HTTP_PORT)   (Ctrl+C pour arrêter)"
 	kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller $(K8S_HTTP_PORT):80 --address 127.0.0.1
 
 k8s-uninstall:       ## [N4] Désinstalle la plateforme (les volumes de données sont conservés)

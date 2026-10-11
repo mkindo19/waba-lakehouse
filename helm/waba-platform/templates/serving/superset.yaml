@@ -1,0 +1,155 @@
+{{- if .Values.superset.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "serving") }}
+{{- $image := printf "%s:%s" .Values.superset.image .Values.localImages.tag }}
+# =============================================================================
+# Superset (énoncé 4.2) : base de métadonnées PostgreSQL sur PVC + serveur web.
+# Au démarrage : migration, compte admin, rôles, puis import des 3 dashboards « as code » (écrasement).
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: superset-db-data
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "superset-db") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.storageClass }}
+  resources: {requests: {storage: {{ .Values.superset.db.storage }}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: superset-db
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "superset-db") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "superset-db") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "superset-db") | nindent 8 }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.superset.db.image }}
+          env:
+            - {name: POSTGRES_USER, value: superset}
+            - {name: POSTGRES_DB, value: superset}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: SUPERSET_DB_PASSWORD}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, superset, -d, superset]}
+            periodSeconds: 10
+          livenessProbe:
+            exec: {command: [pg_isready, -U, superset, -d, superset]}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources: {{- toYaml .Values.superset.db.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: superset-db-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: superset-db
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "superset-db") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "superset-db") | nindent 4 }}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+# superset_config.py + dashboards « as code » (copiés de superset/ par make k8s-files)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: superset-files
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "superset") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/superset/*").AsConfig | nindent 2 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: superset
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "superset") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}             # un seul pod migre la base et importe les dashboards
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "superset") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "superset") | nindent 8 }}
+      annotations:
+        # Configuration ou dashboards modifiés -> helm upgrade redémarre Superset (et ré-importe)
+        checksum/files: {{ (.Files.Glob "files/superset/*").AsConfig | sha256sum }}
+    spec:
+      # Pas de variables « liens de service » : le Service « superset » ferait injecter SUPERSET_PORT=tcp://IP:8088,
+      # que le script de démarrage de l'image lit comme port d'écoute (vécu : « 'tcp' is not a valid port number »).
+      enableServiceLinks: false
+      initContainers:
+        - name: init
+          image: {{ $image }}
+          imagePullPolicy: {{ .Values.localImages.pullPolicy }}
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              for i in $(seq 1 30); do superset db upgrade && break; echo "attente de superset-db..."; sleep 5; done
+              superset fab create-admin --username "$SUPERSET_ADMIN_USER" --password "$SUPERSET_ADMIN_PASSWORD" \
+                --firstname WABA --lastname Admin --email admin@waba.local || true
+              superset init
+              python /app/waba/build_assets.py /tmp/waba_dashboards.zip --db-uri "$WABA_TRINO_URI"
+              python /app/waba/import_assets.py /tmp/waba_dashboards.zip "$SUPERSET_ADMIN_USER"
+          env: {{- include "waba.supersetEnv" . | nindent 12 }}
+          volumeMounts: {{- include "waba.supersetMounts" . | nindent 12 }}
+          resources: {{- toYaml .Values.superset.resources | nindent 12 }}
+      containers:
+        - name: superset
+          image: {{ $image }}
+          imagePullPolicy: {{ .Values.localImages.pullPolicy }}
+          env: {{- include "waba.supersetEnv" . | nindent 12 }}
+          ports:
+            - {name: http, containerPort: 8088}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          resources: {{- toYaml .Values.superset.resources | nindent 12 }}
+          volumeMounts: {{- include "waba.supersetMounts" . | nindent 12 }}
+      volumes:
+        - name: files
+          configMap: {name: superset-files}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: superset
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "superset") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "superset") | nindent 4 }}
+  ports:
+    - {name: http, port: 8088, targetPort: http}
+{{- end }}
