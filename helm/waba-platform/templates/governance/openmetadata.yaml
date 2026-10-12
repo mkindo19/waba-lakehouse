@@ -1,0 +1,231 @@
+{{- if .Values.openmetadata.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "governance") }}
+{{- $om := .Values.openmetadata }}
+# =============================================================================
+# OpenMetadata (énoncé 4.3) : catalogue de données. Base PostgreSQL + Elasticsearch (recherche, lignage) sur PVC,
+# serveur OpenMetadata, et Job de synchronisation (découverte Trino / Kafka + gouvernance as code, cf. governance/).
+# Pas de chart officiel : il déploie aussi un Airflow d'ingestion (~2 Go) dont on n'a pas besoin (cf. D32).
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openmetadata-db-data
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata-db") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.storageClass }}
+  resources: {requests: {storage: {{ $om.db.storage }}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openmetadata-db
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata-db") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "openmetadata-db") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata-db") | nindent 8 }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ $om.db.image }}
+          args: ["-c", "work_mem=10MB"]          # recommandation OpenMetadata (tris du lignage)
+          env:
+            - {name: POSTGRES_USER, value: openmetadata_user}
+            - {name: POSTGRES_DB, value: openmetadata_db}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: OPENMETADATA_DB_PASSWORD}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, openmetadata_user, -d, openmetadata_db]}
+            periodSeconds: 10
+          resources: {{- toYaml $om.db.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: openmetadata-db-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openmetadata-db
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata-db") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "openmetadata-db") | nindent 4 }}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+# Elasticsearch : index de recherche ET stockage du lignage d'OpenMetadata (sans lui, l'API de lignage échoue :
+# vérifié en test local). Un nœud, sécurité désactivée : service interne au cluster, sans Ingress.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openmetadata-search-data
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata-search") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.storageClass }}
+  resources: {requests: {storage: {{ $om.search.storage }}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openmetadata-search
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata-search") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "openmetadata-search") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata-search") | nindent 8 }}
+    spec:
+      initContainers:
+        - name: chown                    # Elasticsearch tourne avec l'utilisateur 1000
+          image: {{ .Values.monitoring.initImage }}
+          command: [sh, -c, "chown -R 1000:1000 /usr/share/elasticsearch/data"]
+          volumeMounts:
+            - {name: data, mountPath: /usr/share/elasticsearch/data}
+      containers:
+        - name: elasticsearch
+          image: {{ $om.search.image }}
+          env:
+            - {name: discovery.type, value: single-node}          # nœud unique : pas de contrôles de démarrage « cluster »
+            - {name: xpack.security.enabled, value: "false"}
+            - {name: ES_JAVA_OPTS, value: {{ $om.search.javaOpts | quote }}}
+            # disque minikube souvent rempli à > 90 % : sans cela, les index passent en lecture seule
+            - {name: cluster.routing.allocation.disk.threshold_enabled, value: "false"}
+          ports:
+            - {name: http, containerPort: 9200}
+          readinessProbe:
+            httpGet: {path: "/_cluster/health?wait_for_status=yellow&timeout=5s", port: http}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources: {{- toYaml $om.search.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /usr/share/elasticsearch/data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: openmetadata-search-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openmetadata-search
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata-search") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "openmetadata-search") | nindent 4 }}
+  ports:
+    - {name: http, port: 9200, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openmetadata
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}             # un seul pod applique les migrations de schéma
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "openmetadata") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata") | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"     # métriques du serveur (port d'administration)
+        prometheus.io/port: "8586"
+        prometheus.io/path: /prometheus
+    spec:
+      enableServiceLinks: false          # pas de variables OPENMETADATA_PORT=tcp://... (cf. D29)
+      initContainers:
+        # Le serveur crée ses index Elasticsearch au démarrage : s'il démarre avant Elasticsearch, il tourne sans
+        # index (erreurs seulement journalisées, vu en test local) et le lignage échoue. On attend donc la recherche.
+        - name: wait-search
+          image: {{ .Values.monitoring.initImage }}
+          command: [sh, -c, "until wget -q -O- 'http://openmetadata-search:9200/_cluster/health?wait_for_status=yellow&timeout=5s'; do echo 'attente de Elasticsearch...'; sleep 5; done"]
+        - name: migrate                  # schéma de la base (idempotent) ; redémarre tant que la base n'est pas prête
+          image: {{ $om.image }}
+          args: [./bootstrap/openmetadata-ops.sh, migrate]
+          env: {{- include "waba.openmetadataEnv" . | nindent 12 }}
+          resources: {{- toYaml $om.resources | nindent 12 }}
+      containers:
+        - name: openmetadata
+          image: {{ $om.image }}
+          env: {{- include "waba.openmetadataEnv" . | nindent 12 }}
+          ports:
+            - {name: http, containerPort: 8585}
+            - {name: admin, containerPort: 8586}
+          startupProbe:                  # démarrage Java + création des index : jusqu'à ~5 min sur minikube
+            httpGet: {path: /healthcheck, port: admin}
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /healthcheck, port: admin}
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: {path: /healthcheck, port: admin}
+            periodSeconds: 30
+            failureThreshold: 5
+          resources: {{- toYaml $om.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openmetadata
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "openmetadata") | nindent 4 }}
+  ports:
+    - {name: http, port: 8585, targetPort: http}
+---
+# Synchronisation du catalogue : à chaque installation (Job nommé d'après la révision Helm) et chaque jour à 05h40 UTC
+# (CronJob : après la chaîne batch de la nuit, avant le SLA du rapport réglementaire de 06h00).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openmetadata-sync-r{{ .Release.Revision }}
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata-sync") | nindent 4 }}
+spec:
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 86400
+  template:
+    {{- include "waba.openmetadataSyncPod" . | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: openmetadata-sync
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "openmetadata-sync") | nindent 4 }}
+spec:
+  schedule: {{ $om.sync.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        {{- include "waba.openmetadataSyncPod" . | nindent 8 }}
+{{- end }}

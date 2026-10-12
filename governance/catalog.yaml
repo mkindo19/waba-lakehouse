@@ -1,0 +1,183 @@
+# =============================================================================
+# Gouvernance WABA « as code » (énoncé 4.3, OpenMetadata) — appliqué par governance/sync.py à chaque déploiement.
+# Les tables elles-mêmes (colonnes, types) sont découvertes automatiquement dans Trino ; ce fichier n'apporte que
+# le sens métier : équipes propriétaires, classifications, glossaire, documentation des tables gold, règles de
+# marquage des données personnelles et lignage raw -> bronze -> silver -> gold.
+# =============================================================================
+service: waba_trino            # service OpenMetadata de type Trino (catalogue Iceberg « iceberg »)
+messaging_service: waba_kafka  # service OpenMetadata de type Kafka (topics raw-*, silver-*, gold-*, dlq-*)
+database: iceberg
+schemas: [raw, bronze, silver, gold]
+
+# ----------------------------------------------------------------------------- équipes (propriétaires)
+teams:
+  - {name: waba_bank, display: WABA Bank, description: "Filiale bancaire : comptes, transactions, crédits (8 pays UEMOA + Ghana)."}
+  - {name: waba_insurance, display: WABA Insurance, description: "Filiale assurance : primes, sinistres (zone CIMA)."}
+  - {name: waba_mobile_money, display: WABA Mobile Money, description: "Filiale monnaie électronique : paiements et transferts mobiles."}
+  - {name: waba_conformite, display: WABA Conformité, description: "Direction conformité groupe : reporting réglementaire BCEAO / CIMA, LBC/FT (AML)."}
+  - {name: waba_data_platform, display: WABA Data Platform, description: "Équipe data : ingestion, couches raw / bronze / silver, qualité."}
+
+# ----------------------------------------------------------------------------- classifications
+classifications:
+  - name: Reglementaire
+    description: Données soumises à un régulateur de la zone (reporting, contrôle, seuils prudentiels).
+    tags:
+      - {name: BCEAO, description: "Banque Centrale des États de l'Afrique de l'Ouest : normes prudentielles bancaires (créances en souffrance, liquidité), monnaie électronique, LBC/FT."}
+      - {name: CIMA, description: "Conférence Interafricaine des Marchés d'Assurances : solvabilité, sinistralité (seuil de vigilance loss ratio 70 %)."}
+  - name: ProtectionDonnees
+    description: Données personnelles au sens du RGPD et des lois locales (Côte d'Ivoire loi 2013-450, Sénégal loi 2008-12, Ghana Data Protection Act 2012...).
+    tags:
+      - {name: DonneePersonnelle, description: "Donnée à caractère personnel (identifiant direct ou indirect d'une personne). Pseudonymisée dès la couche raw (SHA-256 salé + masquage), accès restreint (rôle viewer exclu)."}
+      - {name: Confidentiel, description: "Donnée individuelle sensible non personnelle par nature (ex. montant d'un sinistre individuel) : non exposée au rôle viewer."}
+
+# Marquage des colonnes, sur TOUTES les tables du service (expressions régulières sur le nom de colonne).
+# PII.Sensitive / PII.NonSensitive : classification livrée avec OpenMetadata.
+column_tags:
+  - pattern: '^(customer_id|sender_id|receiver_id)$'
+    tags: [PII.Sensitive, ProtectionDonnees.DonneePersonnelle]
+    description: Identifiant client (personne physique ou morale).
+  - pattern: '^(account_number|iban)(_hash|_masked)?$'
+    tags: [PII.Sensitive, ProtectionDonnees.DonneePersonnelle]
+    description: Numéro de compte / IBAN, pseudonymisé (hash SHA-256 salé) ou masqué dès la couche raw.
+  - pattern: '^(account_id|beneficiary_account|loan_account_id)$'
+    tags: [PII.NonSensitive, ProtectionDonnees.DonneePersonnelle]
+    description: Identifiant technique de compte (donnée personnelle indirecte).
+  - pattern: '^amount$'
+    tables: ['^(raw|bronze|silver)\.insurance_operations$']
+    tags: [ProtectionDonnees.Confidentiel]
+    description: Montant individuel de prime ou de sinistre.
+
+# ----------------------------------------------------------------------------- glossaire financier
+glossary:
+  name: GlossaireFinancierWABA
+  display: Glossaire financier WABA
+  description: Vocabulaire métier commun aux filiales banque, assurance et mobile money du groupe WABA.
+  terms:
+    - {name: NPL, display: "NPL (créances en souffrance)", description: "Part des encours de crédit en retard de paiement de plus de 90 jours. Seuil d'alerte BCEAO : 5 % (vert < 3 %, orange 3-5 %, rouge > 5 %)."}
+    - {name: LossRatio, display: Loss ratio, description: "Ratio sinistres payés / primes acquises, par produit et par pays. Seuil de vigilance CIMA : 70 %."}
+    - {name: ARPC, display: "ARPC (revenu moyen par client)", description: "Revenu mensuel moyen par client actif : commissions, frais et intérêts, converti en EUR."}
+    - {name: AML, display: "AML / LBC-FT", description: "Lutte contre le blanchiment de capitaux et le financement du terrorisme : transactions au-delà de 10 M XOF (ou équivalent) signalées au contrôle."}
+    - {name: Fraude, display: Fraude (rafale), description: "Série anormale d'opérations sur un même compte dans une courte fenêtre (règle R1 : 3 virements en 5 minutes)."}
+    - {name: Liquidite, display: Alerte de liquidité, description: "Couverture des sorties nettes par les dépôts sur 5 minutes glissantes, par pays ; alerte sous 98 %."}
+    - {name: CorridorTransfrontalier, display: Corridor transfrontalier, description: "Couple pays émetteur -> pays récepteur d'un transfert mobile money (ex. CI -> SN)."}
+    - {name: MonnaieElectronique, display: Monnaie électronique, description: "Valeur monétaire stockée sur un portefeuille mobile, émise sous agrément BCEAO."}
+    - {name: SLASinistre, display: SLA sinistre, description: "Délai contractuel de traitement d'un sinistre : 30 jours (IARD), 45 jours (Vie)."}
+    - {name: EUR, display: Montant EUR, description: "Montant converti en euros : XOF à parité fixe (655,957), GHS au taux de référence du jour (Airflow Variable waba_ghs_per_eur)."}
+
+# ----------------------------------------------------------------------------- documentation des tables gold
+gold_tables:
+  daily_transaction_volume:
+    owner: waba_bank
+    description: "Volume et montant (EUR) des transactions bancaires par jour, pays, entité et type d'opération. Source : silver.bank_transactions (job silver_to_gold, DAG dag_silver_to_gold, quotidien)."
+    tags: [Reglementaire.BCEAO]
+    glossary: [EUR]
+  npl_ratio_by_country:
+    owner: waba_bank
+    description: "Taux de créances en souffrance (NPL) par pays et par mois, avec sa classe de risque (vert / orange / rouge). Indicateur prudentiel BCEAO, seuil 5 %."
+    tags: [Reglementaire.BCEAO]
+    glossary: [NPL]
+  customer_arpu_monthly:
+    owner: waba_bank
+    description: "Revenu moyen par client actif et par mois (commissions bancaires + frais mobile money + intérêts de crédit), en EUR."
+    glossary: [ARPC, EUR]
+  loss_ratio_by_product:
+    owner: waba_insurance
+    description: "Loss ratio (sinistres / primes) par produit d'assurance et par pays. Seuil de vigilance CIMA : 70 %."
+    tags: [Reglementaire.CIMA]
+    glossary: [LossRatio]
+  claims_processing_time:
+    owner: waba_insurance
+    description: "Délai moyen de traitement des sinistres (jours ouvrés) par branche et par pays, comparé au SLA contractuel."
+    tags: [Reglementaire.CIMA]
+    glossary: [SLASinistre]
+  mobile_money_daily_flow:
+    owner: waba_mobile_money
+    description: "Flux journaliers de paiements mobile money par pays, opérateur et type (nombre, montant EUR, taux d'échec)."
+    tags: [Reglementaire.BCEAO]
+    glossary: [MonnaieElectronique, EUR]
+  cross_border_transfers:
+    owner: waba_mobile_money
+    description: "Transferts mobile money transfrontaliers par corridor (pays émetteur -> récepteur) et par semaine."
+    tags: [Reglementaire.BCEAO]
+    glossary: [CorridorTransfrontalier, MonnaieElectronique]
+  regulatory_daily_report:
+    owner: waba_conformite
+    description: "Rapport réglementaire quotidien J-1 (BCEAO / CIMA) : agrégats bancaires, assurance et NPL par pays. Produit par dag_regulatory_report, disponible avant 06h00 UTC (alerte Grafana sinon) et exporté en CSV dans MinIO."
+    tags: [Reglementaire.BCEAO, Reglementaire.CIMA]
+    glossary: [NPL, LossRatio]
+  rt_fraud_alerts:
+    owner: waba_conformite
+    description: "Alertes de fraude temps réel (règle rafale R1, pays inhabituel), produites par le job streaming stream_fraud_aml et publiées dans gold-fraud-alerts."
+    glossary: [Fraude]
+  rt_aml_events:
+    owner: waba_conformite
+    description: "Événements AML temps réel : transactions au-delà du seuil LBC/FT (10 M XOF ou équivalent EUR), job streaming stream_fraud_aml."
+    tags: [Reglementaire.BCEAO]
+    glossary: [AML]
+  rt_liquidity_alerts:
+    owner: waba_conformite
+    description: "Alertes de liquidité temps réel par pays (couverture des sorties nettes sur 5 minutes)."
+    tags: [Reglementaire.BCEAO]
+    glossary: [Liquidite]
+
+# Propriétaire par défaut des autres couches
+default_owner: waba_data_platform
+
+# ----------------------------------------------------------------------------- pipelines et lignage
+# Pipelines (DAGs Airflow et jobs streaming) déclarés dans OpenMetadata, puis lignage table -> table.
+# Chaque arête porte le pipeline qui la réalise : le graphe raw -> bronze -> silver -> gold se lit avec ses DAGs.
+pipelines:
+  - {name: dag_ingest_raw, description: "Fichiers MinIO raw-landing -> tables raw (validation, pseudonymisation PII) -> bronze.", tasks: [check_new_files, landing_to_raw, raw_to_bronze]}
+  - {name: dag_bronze_to_silver, description: "bronze -> silver : nettoyage, conversion EUR, enrichissement par les référentiels.", tasks: [silver_referentials, silver_bank_transactions, silver_insurance_operations, silver_mobile_money_payments, silver_loan_repayments]}
+  - {name: dag_silver_to_gold, description: "silver -> gold : les KPIs financiers et réglementaires.", tasks: [gold_banking, gold_insurance, gold_mobile_money]}
+  - {name: dag_regulatory_report, description: "Rapport réglementaire J-1 (BCEAO / CIMA), SLA 06h00 UTC.", tasks: [refresh_silver_bank, refresh_silver_insurance, refresh_gold_npl, build_regulatory_report]}
+  - {name: stream_raw_to_silver, description: "Job Spark Structured Streaming 1 : topics raw-* -> topics silver-* + tables silver.rt_*.", tasks: []}
+  - {name: stream_fraud_aml, description: "Job Spark Structured Streaming 2 : topics silver-* -> alertes fraude / AML / liquidité (gold.rt_*).", tasks: []}
+
+lineage:
+  dag_ingest_raw:
+    raw.customers: [bronze.customers]
+    raw.products: [bronze.products]
+    raw.branches: [bronze.branches]
+    raw.accounts: [bronze.accounts]
+    raw.bank_transactions: [bronze.bank_transactions]
+    raw.insurance_operations: [bronze.insurance_operations]
+    raw.mobile_money_payments: [bronze.mobile_money_payments]
+    raw.loan_repayments: [bronze.loan_repayments]
+  dag_bronze_to_silver:
+    bronze.customers: [silver.customers]
+    bronze.products: [silver.products]
+    bronze.branches: [silver.branches]
+    bronze.accounts: [silver.accounts]
+    silver.customers: [silver.accounts, silver.insurance_operations, silver.mobile_money_payments]
+    silver.products: [silver.accounts]
+    bronze.bank_transactions: [silver.bank_transactions]
+    silver.accounts: [silver.bank_transactions, silver.loan_repayments]
+    silver.branches: [silver.bank_transactions]
+    bronze.insurance_operations: [silver.insurance_operations]
+    bronze.mobile_money_payments: [silver.mobile_money_payments]
+    bronze.loan_repayments: [silver.loan_repayments]
+  dag_silver_to_gold:
+    silver.bank_transactions: [gold.daily_transaction_volume, gold.customer_arpu_monthly]
+    silver.loan_repayments: [gold.npl_ratio_by_country, gold.customer_arpu_monthly]
+    silver.mobile_money_payments: [gold.customer_arpu_monthly, gold.mobile_money_daily_flow, gold.cross_border_transfers]
+    silver.insurance_operations: [gold.loss_ratio_by_product, gold.claims_processing_time]
+  dag_regulatory_report:
+    silver.bank_transactions: [gold.regulatory_daily_report]
+    silver.insurance_operations: [gold.regulatory_daily_report]
+    gold.npl_ratio_by_country: [gold.regulatory_daily_report]
+  # Jobs streaming : lignage à travers les topics Kafka (service OpenMetadata « waba_kafka », préfixe topic:)
+  stream_raw_to_silver:
+    topic:raw-bank-transactions: [silver.rt_bank_transactions, topic:silver-bank-transactions]
+    topic:raw-insurance-operations: [silver.rt_insurance_operations, topic:silver-insurance-operations]
+    topic:raw-mobile-money-payments: [silver.rt_mobile_money_payments, topic:silver-mobile-money]
+    topic:raw-loan-repayments: [silver.rt_loan_repayments]
+  stream_fraud_aml:
+    topic:silver-bank-transactions: [gold.rt_fraud_alerts, gold.rt_aml_events, gold.rt_liquidity_alerts]
+    topic:silver-mobile-money: [gold.rt_fraud_alerts]
+    topic:silver-insurance-operations: [gold.rt_fraud_alerts]
+    silver.customers: [gold.rt_fraud_alerts]
+    silver.accounts: [gold.rt_fraud_alerts, gold.rt_liquidity_alerts]
+    gold.rt_fraud_alerts: [topic:gold-fraud-alerts]
+    gold.rt_aml_events: [topic:gold-aml-events]
+    gold.rt_liquidity_alerts: [topic:gold-liquidity-alerts]

@@ -200,3 +200,55 @@ trino://{{ .Values.superset.trinoUser }}@{{ include "waba.svc" (dict "ctx" . "do
 - {name: files, mountPath: /app/waba, readOnly: true}
 - {name: files, mountPath: /app/pythonpath/superset_config.py, subPath: superset_config.py, readOnly: true}
 {{- end -}}
+
+{{/* OpenMetadata : configuration du serveur (initContainer de migration + serveur), aucun secret en clair */}}
+{{- define "waba.openmetadataEnv" -}}
+- {name: OPENMETADATA_CLUSTER_NAME, value: waba}
+- {name: SERVER_HOST_API_URL, value: "http://openmetadata.{{ include "waba.ns" (dict "ctx" . "domain" "governance") }}.svc.cluster.local:8585/api"}
+- {name: OPENMETADATA_HEAP_OPTS, value: {{ .Values.openmetadata.heapOpts | quote }}}
+- {name: LOG_LEVEL, value: WARN}
+# base de métadonnées
+- {name: DB_DRIVER_CLASS, value: org.postgresql.Driver}
+- {name: DB_SCHEME, value: postgresql}
+- {name: DB_HOST, value: openmetadata-db}
+- {name: DB_PORT, value: "5432"}
+- {name: DB_PARAMS, value: "allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC"}
+- {name: OM_DATABASE, value: openmetadata_db}
+- {name: DB_USER, value: openmetadata_user}
+- name: DB_USER_PASSWORD
+  valueFrom: {secretKeyRef: {name: waba-secrets, key: OPENMETADATA_DB_PASSWORD}}
+# recherche / lignage
+- {name: SEARCH_TYPE, value: elasticsearch}
+- {name: ELASTICSEARCH_HOST, value: openmetadata-search}
+- {name: ELASTICSEARCH_PORT, value: "9200"}
+- {name: ELASTICSEARCH_SCHEME, value: http}
+# authentification « basic » (comptes OpenMetadata) ; SSO Keycloak : niveau 4.3 suite (4f)
+- {name: AUTHENTICATION_PROVIDER, value: basic}
+- {name: AUTHORIZER_ADMIN_PRINCIPALS, value: "[admin]"}
+- {name: AUTHENTICATION_PUBLIC_KEYS, value: "[http://localhost:8585/api/v1/system/config/jwks]"}
+- {name: AUTHENTICATION_ENABLE_SELF_SIGNUP, value: "false"}
+# pas d'Airflow d'ingestion : la découverte passe par le Job openmetadata-sync
+- {name: PIPELINE_SERVICE_CLIENT_ENABLED, value: "false"}
+- name: FERNET_KEY                     # chiffrement des mots de passe de connexion stockés en base
+  valueFrom: {secretKeyRef: {name: waba-secrets, key: OPENMETADATA_FERNET_KEY}}
+{{- end -}}
+
+{{/* OpenMetadata : pod du Job / CronJob de synchronisation (governance/sync.py) */}}
+{{- define "waba.openmetadataSyncPod" -}}
+metadata:
+  labels: {{- include "waba.component" (dict "ctx" . "name" "openmetadata-sync") | nindent 4 }}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: sync
+      image: "{{ .Values.openmetadata.sync.image }}:{{ .Values.localImages.tag }}"
+      imagePullPolicy: {{ .Values.localImages.pullPolicy }}
+      env:
+        - {name: OM_URL, value: "http://openmetadata:8585"}
+        - {name: TRINO_HOST_PORT, value: "{{ include "waba.svc" (dict "ctx" . "domain" "serving" "name" "trino") }}:8080"}
+        - {name: KAFKA_BOOTSTRAP, value: "{{ include "waba.svc" (dict "ctx" . "domain" "ingestion" "name" "kafka") }}:9092"}
+        - {name: AIRFLOW_UI_URL, value: "http://airflow.{{ .Values.ingress.domain }}:{{ .Values.ingress.port }}"}
+        - name: OPENMETADATA_ADMIN_PASSWORD
+          valueFrom: {secretKeyRef: {name: waba-secrets, key: OPENMETADATA_ADMIN_PASSWORD}}
+      resources: {{- toYaml .Values.openmetadata.sync.resources | nindent 8 }}
+{{- end -}}

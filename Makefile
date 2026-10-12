@@ -65,7 +65,7 @@ test-spark:          ## Tests des transformations Spark (nécessite Java + pyspa
 	cd spark && python -m pytest -q tests
 
 lint:                ## Vérification PEP 8 (ruff)
-	ruff check generator spark airflow superset
+	ruff check generator spark airflow superset governance
 
 # ----------------------------------------------------------------------------- niveau 3 : streaming
 KAFKA_EXEC := $(COMPOSE) exec -T kafka /opt/kafka/bin
@@ -186,10 +186,11 @@ k8s-install: k8s-files k8s-secrets k8s-crds   ## [N4] Installe / met à jour TOU
 	helm upgrade --install $(K8S_RELEASE) $(HELM_CHART) -n $(K8S_NS) --create-namespace \
 	  -f helm/values-secrets.yaml --wait --timeout 20m
 
-LOCAL_IMAGES := waba/generator:$(or $(WABA_VERSION),dev) waba/spark:$(or $(WABA_VERSION),dev) waba/airflow:$(or $(WABA_VERSION),dev) waba/superset:$(or $(WABA_VERSION),dev)
+LOCAL_IMAGES := waba/generator:$(or $(WABA_VERSION),dev) waba/spark:$(or $(WABA_VERSION),dev) waba/airflow:$(or $(WABA_VERSION),dev) waba/superset:$(or $(WABA_VERSION),dev) waba/om-sync:$(or $(WABA_VERSION),dev)
 k8s-images:          ## [N4] Construit les images maison (docker compose) et les charge dans minikube (~5 min)
 	$(COMPOSE) build generator spark-master airflow-scheduler
 	docker build -t waba/superset:$(or $(WABA_VERSION),dev) superset
+	docker build -t waba/om-sync:$(or $(WABA_VERSION),dev) governance
 	@for img in $(LOCAL_IMAGES); do echo "-> minikube image load $$img"; minikube image load $$img || exit 1; done
 	@minikube image ls | grep waba/
 
@@ -241,6 +242,11 @@ k8s-demo-repair:     ## [N4] DÉMO alertes : rétablit le job fraude
 	  -p '{"spec":{"mainApplicationFile":"local:///opt/spark-apps/stream_fraud_aml.py"}}'
 	@echo "Job fraude rétabli (redémarrage du driver en ~1 min)."
 
+# --- Gouvernance (niveau 4.3)
+k8s-om-sync:         ## [N4] Relance la synchronisation OpenMetadata (découverte Trino/Kafka + gouvernance as code)
+	kubectl create job -n governance --from=cronjob/openmetadata-sync om-sync-$$(date +%s)
+	@echo "Suivi : kubectl logs -n governance -l app.kubernetes.io/name=openmetadata-sync -f --tail=50"
+
 ROWS ?= 2000
 DURATION ?= 90
 k8s-stream:          ## [N4] Flux continu de transactions (ROWS par lot, DURATION secondes)
@@ -267,7 +273,7 @@ k8s-status:          ## [N4] Pods, volumes et URL de la plateforme
 	@echo; kubectl get ingress -A -o custom-columns=NAMESPACE:.metadata.namespace,URL:.spec.rules[0].host
 
 k8s-expose:          ## [N4] Rend les interfaces accessibles depuis Windows : http://<ui>.localtest.me (laisser tourner)
-	@echo "Interfaces (port $(K8S_HTTP_PORT)) : kafka-ui, minio, generator, nifi/nifi, trino, airflow, superset, grafana, prometheus  ->  http://<nom>.localtest.me:$(K8S_HTTP_PORT)   (Ctrl+C pour arrêter)"
+	@echo "Interfaces (port $(K8S_HTTP_PORT)) : kafka-ui, minio, generator, nifi/nifi, trino, airflow, superset, grafana, prometheus, openmetadata  ->  http://<nom>.localtest.me:$(K8S_HTTP_PORT)   (Ctrl+C pour arrêter)"
 	kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller $(K8S_HTTP_PORT):80 --address 127.0.0.1
 
 k8s-uninstall:       ## [N4] Désinstalle la plateforme (les volumes de données sont conservés)

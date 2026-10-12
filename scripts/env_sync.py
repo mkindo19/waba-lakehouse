@@ -19,8 +19,10 @@ EXAMPLE, TARGET = ROOT / ".env.example", ROOT / ".env"
 
 
 def secret_for(key: str) -> str:
-    if key == "AIRFLOW_FERNET_KEY":                       # format exigé par Airflow
+    if key.endswith("FERNET_KEY"):                        # format Fernet (Airflow, OpenMetadata)
         return base64.urlsafe_b64encode(os.urandom(32)).decode()
+    if key == "OPENMETADATA_ADMIN_PASSWORD":              # politique OpenMetadata : maj., min., chiffre, spécial
+        return f"Wb#{secrets.token_hex(12)}a9Z"
     if key == "SUPERSET_SECRET_KEY":                      # clé de session : longue (recommandation Superset)
         return secrets.token_urlsafe(42)
     return secrets.token_hex(24 if "SALT" in key else 16)

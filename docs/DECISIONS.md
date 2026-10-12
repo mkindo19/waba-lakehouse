@@ -442,3 +442,37 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
   Idempotent ; le fichier SQLite est conservé (retour arrière). Testé sur PostgreSQL 16 (2 passages ; un bug de
   lecture des colonnes trouvé et corrigé grâce au test).
 - **Niveaux 1-3 (docker compose)** : SQLite conservé (un seul poste, charge faible).
+
+## D32 — OpenMetadata : catalogue, lignage et PII « as code »
+- **Déploiement** (namespace `governance`) : serveur OpenMetadata 1.10.14, PostgreSQL et Elasticsearch 8.11 sur
+  PVC (`keep`). Pas de chart officiel : il installe aussi un Airflow d'ingestion (~2 Go de mémoire) alors que la
+  plateforme en a déjà un et que la découverte tient dans un Job. Le serveur attend Elasticsearch avant de
+  démarrer : sans index, OpenMetadata démarre quand même mais l'API de lignage répond 500 (vu en test local).
+- **Découverte automatique** : un Job (`openmetadata-sync`, image `waba/om-sync` = connecteurs officiels Trino et
+  Kafka, même version que le serveur) lit les tables Iceberg des schémas raw, bronze, silver, gold via Trino et les
+  topics Kafka. Lancé à chaque `make k8s-install` et chaque jour à 05h40 UTC (CronJob : après la chaîne batch de
+  la nuit) ; à la demande : `make k8s-om-sync`.
+- **Gouvernance as code** (`governance/catalog.yaml`, appliqué par le même Job, idempotent) :
+  - 5 équipes propriétaires (Bank, Insurance, Mobile Money, Conformité, Data Platform) ;
+  - classifications `Reglementaire` (BCEAO, CIMA) et `ProtectionDonnees` (DonneePersonnelle, Confidentiel) ;
+  - glossaire financier (10 termes : NPL, loss ratio, ARPC, AML...) rattaché aux tables gold ;
+  - les 11 tables gold documentées (description métier, propriétaire, tags réglementaires, termes du glossaire) ;
+  - marquage PII par règles sur le nom des colonnes, sur toutes les couches : `customer_id`, `sender_id`,
+    `receiver_id`, `account_number*`, `iban*` -> `PII.Sensitive` + `ProtectionDonnees.DonneePersonnelle` ;
+    identifiants de compte -> `PII.NonSensitive` ; montants individuels de sinistres -> `Confidentiel` (servira au
+    masquage du rôle viewer, 4f).
+- **Lignage** : les transformations sont faites par Spark (pas par Trino), donc aucun journal de requêtes Trino ne
+  peut le déduire. Le lignage table -> table (53 arêtes, dont le temps réel à travers les topics Kafka) est déclaré
+  à côté du code dans `catalog.yaml` et poussé automatiquement par le Job, chaque arête portant le pipeline qui la
+  réalise (entités Pipeline : les 4 DAGs Airflow avec lien vers leur page, les 2 jobs streaming). Évolution
+  production : agent OpenLineage dans Spark (lignage au niveau colonne, capté à l'exécution).
+- **Sécurité** : le mot de passe par défaut du compte `admin` est remplacé au premier passage par
+  `OPENMETADATA_ADMIN_PASSWORD` (.env -> waba-secrets) ; clé Fernet propre ; inscription libre désactivée ;
+  Elasticsearch sans Ingress. Reste à faire en production : clés RSA de signature JWT propres (celles de l'image
+  sont publiques) et SSO Keycloak (4f).
+- **Validation avant livraison** : serveur OpenMetadata 1.10.14 lancé localement sur PostgreSQL 16 (sans
+  Elasticsearch) ; tables simulées à partir des schémas réels (`spark/jobs/common/datasets.py`) ; synchronisation
+  jouée deux fois (idempotence) : équipes, classifications, glossaire, 11 tables gold documentées, 62 colonnes
+  marquées, pipelines vérifiés via l'API. Non testable localement : lignage (Elasticsearch requis) et connexion à
+  Trino / Kafka (configuration validée par le SDK). Trouvé en test : dépendance `cachetools` manquante du paquet
+  `openmetadata-ingestion` 1.10.14 (ajoutée à l'image), politique de mot de passe d'OpenMetadata (générateur adapté).
