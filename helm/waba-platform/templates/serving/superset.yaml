@@ -3,7 +3,8 @@
 {{- $image := printf "%s:%s" .Values.superset.image .Values.localImages.tag }}
 # =============================================================================
 # Superset (énoncé 4.2) : base de métadonnées PostgreSQL sur PVC + serveur web.
-# Au démarrage : migration, compte admin, rôles, puis import des 3 dashboards « as code » (écrasement).
+# Au démarrage : migration, compte admin, rôles, import des 3 dashboards « as code » (écrasement), puis
+# rôles WABA_* et filtres pays (RLS) « as code ». Connexion : SSO Keycloak (4.3, cf. superset_config.py).
 # =============================================================================
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -115,6 +116,7 @@ spec:
               superset init
               python /app/waba/build_assets.py /tmp/waba_dashboards.zip --db-uri "$WABA_TRINO_URI"
               python /app/waba/import_assets.py /tmp/waba_dashboards.zip "$SUPERSET_ADMIN_USER"
+              python /app/waba/apply_security.py     # rôles WABA_*, filtres pays (RLS), accès aux dashboards
           env: {{- include "waba.supersetEnv" . | nindent 12 }}
           volumeMounts: {{- include "waba.supersetMounts" . | nindent 12 }}
           resources: {{- toYaml .Values.superset.resources | nindent 12 }}

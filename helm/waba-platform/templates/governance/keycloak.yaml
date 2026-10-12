@@ -1,0 +1,154 @@
+{{- if .Values.keycloak.enabled }}
+{{- $ns := include "waba.ns" (dict "ctx" $ "domain" "governance") }}
+{{- $kc := .Values.keycloak }}
+# =============================================================================
+# Keycloak (énoncé 4.3) : fournisseur d'identité OIDC / OAuth2, SSO de Superset et Trino.
+# Base PostgreSQL sur PVC + serveur Keycloak. Le realm « waba » (4 rôles, groupes pays, clients superset et
+# trino, utilisateurs de démonstration) est décrit as code (keycloak/gen_realm.py -> waba-realm.json) et
+# ré-importé en écrasement à chaque démarrage : le dépôt reste la source de vérité (cf. D33).
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keycloak-db-data
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "keycloak-db") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.storageClass }}
+  resources: {requests: {storage: {{ $kc.db.storage }}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak-db
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "keycloak-db") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "keycloak-db") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "keycloak-db") | nindent 8 }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ $kc.db.image }}
+          env:
+            - {name: POSTGRES_USER, value: keycloak}
+            - {name: POSTGRES_DB, value: keycloak}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: KEYCLOAK_DB_PASSWORD}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, keycloak, -d, keycloak]}
+            periodSeconds: 10
+          resources: {{- toYaml $kc.db.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: keycloak-db-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-db
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "keycloak-db") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "keycloak-db") | nindent 4 }}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+# Realm « waba » (copié de keycloak/ par make k8s-files). Les secrets n'y figurent pas : placeholders ${VAR}
+# remplacés par Keycloak à l'import, depuis les variables d'environnement (Secret waba-secrets).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-realm
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "keycloak") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/keycloak/*-realm.json").AsConfig | nindent 2 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "keycloak") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}             # un seul pod importe le realm dans la base
+  selector:
+    matchLabels: {{- include "waba.selector" (dict "name" "keycloak") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "waba.component" (dict "ctx" $ "name" "keycloak") | nindent 8 }}
+      annotations:
+        checksum/realm: {{ (.Files.Glob "files/keycloak/*-realm.json").AsConfig | sha256sum | trunc 16 }}
+        # Métriques Keycloak (connexions, échecs, sessions) sur le port de gestion
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9000"
+        prometheus.io/path: /metrics
+    spec:
+      enableServiceLinks: false
+      initContainers:
+        # Import du realm en écrasement (« --override true ») : toute modification de waba-realm.json est
+        # appliquée au redémarrage. Les changements faits dans la console d'administration sont perdus (voulu).
+        - name: import-realm
+          image: {{ $kc.image }}
+          args: [import, --dir, /opt/keycloak/data/import, --override, "true"]
+          env: {{- include "waba.keycloakEnv" . | nindent 12 }}
+            - name: KEYCLOAK_DEMO_PASSWORD
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: KEYCLOAK_DEMO_PASSWORD}}
+            - name: SUPERSET_OIDC_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: SUPERSET_OIDC_CLIENT_SECRET}}
+            - name: TRINO_OIDC_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: TRINO_OIDC_CLIENT_SECRET}}
+          resources: {{- toYaml $kc.resources | nindent 12 }}
+          volumeMounts:
+            - {name: realm, mountPath: /opt/keycloak/data/import, readOnly: true}
+      containers:
+        - name: keycloak
+          image: {{ $kc.image }}
+          args: [start]
+          env: {{- include "waba.keycloakEnv" . | nindent 12 }}
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: management, containerPort: 9000}
+          startupProbe:
+            httpGet: {path: /health/started, port: management}
+            periodSeconds: 5
+            failureThreshold: 60               # 1re mise en route (construction Quarkus) : jusqu'à 5 min
+          readinessProbe:
+            httpGet: {path: /health/ready, port: management}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health/live, port: management}
+            periodSeconds: 30
+            failureThreshold: 5
+          resources: {{- toYaml $kc.resources | nindent 12 }}
+      volumes:
+        - name: realm
+          configMap: {name: keycloak-realm}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: {{ $ns }}
+  labels: {{- include "waba.component" (dict "ctx" $ "name" "keycloak") | nindent 4 }}
+spec:
+  selector: {{- include "waba.selector" (dict "name" "keycloak") | nindent 4 }}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+    - {name: management, port: 9000, targetPort: management}
+{{- end }}

@@ -1,0 +1,387 @@
+{
+  "realm": "waba",
+  "displayName": "WABA Group",
+  "enabled": true,
+  "sslRequired": "none",
+  "internationalizationEnabled": true,
+  "supportedLocales": [
+    "fr",
+    "en"
+  ],
+  "defaultLocale": "fr",
+  "loginWithEmailAllowed": true,
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "bruteForceProtected": true,
+  "failureFactor": 5,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "passwordPolicy": "length(12) and upperCase(1) and lowerCase(1) and digits(1) and notUsername",
+  "roles": {
+    "realm": [
+      {
+        "name": "group_admin",
+        "description": "Administrateur groupe : toutes les entités, tous les pays, toutes les données"
+      },
+      {
+        "name": "country_analyst",
+        "description": "Analyste pays : données de SON pays uniquement (groupe pays_XX)"
+      },
+      {
+        "name": "compliance_officer",
+        "description": "Conformité : tables gold réglementaires uniquement (BCEAO, CIMA), tous pays"
+      },
+      {
+        "name": "viewer",
+        "description": "Lecteur : dashboards agrégés uniquement, aucune donnée sensible (IBAN, comptes, montants individuels)"
+      }
+    ]
+  },
+  "groups": [
+    {
+      "name": "administrateurs",
+      "path": "/administrateurs",
+      "realmRoles": [
+        "group_admin"
+      ]
+    },
+    {
+      "name": "analystes_pays",
+      "path": "/analystes_pays",
+      "realmRoles": [
+        "country_analyst"
+      ]
+    },
+    {
+      "name": "conformite",
+      "path": "/conformite",
+      "realmRoles": [
+        "compliance_officer"
+      ]
+    },
+    {
+      "name": "lecteurs",
+      "path": "/lecteurs",
+      "realmRoles": [
+        "viewer"
+      ]
+    },
+    {
+      "name": "pays_CI",
+      "path": "/pays_CI",
+      "attributes": {
+        "country_code": [
+          "CI"
+        ]
+      }
+    },
+    {
+      "name": "pays_SN",
+      "path": "/pays_SN",
+      "attributes": {
+        "country_code": [
+          "SN"
+        ]
+      }
+    },
+    {
+      "name": "pays_ML",
+      "path": "/pays_ML",
+      "attributes": {
+        "country_code": [
+          "ML"
+        ]
+      }
+    },
+    {
+      "name": "pays_BF",
+      "path": "/pays_BF",
+      "attributes": {
+        "country_code": [
+          "BF"
+        ]
+      }
+    },
+    {
+      "name": "pays_GN",
+      "path": "/pays_GN",
+      "attributes": {
+        "country_code": [
+          "GN"
+        ]
+      }
+    },
+    {
+      "name": "pays_TG",
+      "path": "/pays_TG",
+      "attributes": {
+        "country_code": [
+          "TG"
+        ]
+      }
+    },
+    {
+      "name": "pays_BJ",
+      "path": "/pays_BJ",
+      "attributes": {
+        "country_code": [
+          "BJ"
+        ]
+      }
+    },
+    {
+      "name": "pays_GH",
+      "path": "/pays_GH",
+      "attributes": {
+        "country_code": [
+          "GH"
+        ]
+      }
+    }
+  ],
+  "users": [
+    {
+      "username": "admin.groupe",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Awa",
+      "lastName": "Diop",
+      "email": "admin.groupe@waba-group.example",
+      "groups": [
+        "/administrateurs"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "analyste.ci",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Koffi",
+      "lastName": "Kouassi",
+      "email": "analyste.ci@waba-group.example",
+      "groups": [
+        "/analystes_pays",
+        "/pays_CI"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "analyste.sn",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Fatou",
+      "lastName": "Ndiaye",
+      "email": "analyste.sn@waba-group.example",
+      "groups": [
+        "/analystes_pays",
+        "/pays_SN"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "conformite",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Ibrahim",
+      "lastName": "Traoré",
+      "email": "conformite@waba-group.example",
+      "groups": [
+        "/conformite"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "lecteur",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Ama",
+      "lastName": "Mensah",
+      "email": "lecteur@waba-group.example",
+      "groups": [
+        "/lecteurs"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "superset",
+      "name": "Superset (dashboards)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${SUPERSET_OIDC_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "implicitFlowEnabled": false,
+      "frontchannelLogout": true,
+      "redirectUris": [
+        "http://superset.localtest.me:8090/oauth-authorized/keycloak"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "rootUrl": "http://superset.localtest.me:8090",
+      "baseUrl": "/",
+      "attributes": {
+        "post.logout.redirect.uris": "http://superset.localtest.me:8090/*",
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": [
+        "basic",
+        "profile",
+        "email",
+        "web-origins",
+        "acr"
+      ],
+      "optionalClientScopes": [
+        "offline_access"
+      ],
+      "protocolMappers": [
+        {
+          "name": "roles WABA",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true",
+            "usermodel.realmRoleMapping.rolePrefix": ""
+          }
+        },
+        {
+          "name": "groupes WABA",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true",
+            "full.path": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "trino",
+      "name": "Trino (SQL)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${TRINO_OIDC_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "implicitFlowEnabled": false,
+      "frontchannelLogout": true,
+      "redirectUris": [
+        "http://trino.localtest.me:8090/oauth2/callback",
+        "http://trino.localtest.me:8090/ui/logout/logout.html"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "rootUrl": "http://trino.localtest.me:8090",
+      "baseUrl": "/",
+      "attributes": {
+        "post.logout.redirect.uris": "http://trino.localtest.me:8090/*"
+      },
+      "defaultClientScopes": [
+        "basic",
+        "profile",
+        "email",
+        "web-origins",
+        "acr"
+      ],
+      "optionalClientScopes": [
+        "offline_access"
+      ],
+      "protocolMappers": [
+        {
+          "name": "roles WABA",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true",
+            "usermodel.realmRoleMapping.rolePrefix": ""
+          }
+        },
+        {
+          "name": "groupes WABA",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true",
+            "full.path": "false"
+          }
+        },
+        {
+          "name": "audience trino",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "trino",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}

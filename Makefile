@@ -5,7 +5,7 @@ SPARK_SUBMIT := $(COMPOSE) exec -T spark-master /opt/spark/bin/spark-submit --ma
 DATASET ?= all
 COUNTRY ?=
 
-.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3 k8s-files k8s-secrets k8s-install k8s-status k8s-expose k8s-uninstall k8s-lint k8s-images k8s-referentials k8s-stream k8s-trino k8s-deps k8s-crds k8s-spark k8s-spark-logs k8s-generate k8s-dag k8s-dag-runs k8s-dags-on k8s-alert-test k8s-gold-peek k8s-deps-update k8s-start
+.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3 k8s-files k8s-secrets k8s-install k8s-status k8s-expose k8s-uninstall k8s-lint k8s-images k8s-referentials k8s-stream k8s-trino k8s-deps k8s-crds k8s-spark k8s-spark-logs k8s-generate k8s-dag k8s-dag-runs k8s-dags-on k8s-alert-test k8s-gold-peek k8s-deps-update k8s-start k8s-sso
 
 help:                ## Liste des commandes
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -65,7 +65,7 @@ test-spark:          ## Tests des transformations Spark (nécessite Java + pyspa
 	cd spark && python -m pytest -q tests
 
 lint:                ## Vérification PEP 8 (ruff)
-	ruff check generator spark airflow superset governance
+	ruff check generator spark airflow superset governance keycloak
 
 # ----------------------------------------------------------------------------- niveau 3 : streaming
 KAFKA_EXEC := $(COMPOSE) exec -T kafka /opt/kafka/bin
@@ -154,7 +154,8 @@ k8s-files:           ## [N4] Copie les scripts de infra/ dans le chart (Helm ne 
 	@cp infra/nifi/deploy_flow.py $(HELM_CHART)/files/nifi/deploy_flow.py
 	@cp trino/kafka/*.json $(HELM_CHART)/files/trino-kafka/
 	@rm -f $(HELM_CHART)/files/airflow-dags/*.py && cp airflow/dags/*.py $(HELM_CHART)/files/airflow-dags/
-	@cp superset/superset_config.py superset/dashboards/build_assets.py superset/dashboards/import_assets.py $(HELM_CHART)/files/superset/
+	@cp superset/superset_config.py superset/dashboards/build_assets.py superset/dashboards/import_assets.py superset/dashboards/apply_security.py $(HELM_CHART)/files/superset/
+	@mkdir -p $(HELM_CHART)/files/keycloak && cp keycloak/waba-realm.json $(HELM_CHART)/files/keycloak/
 	@rm -rf $(HELM_CHART)/files/monitoring && mkdir -p $(HELM_CHART)/files/monitoring/grafana
 	@cp -r monitoring/prometheus monitoring/loki monitoring/promtail monitoring/statsd $(HELM_CHART)/files/monitoring/
 	@cp -r monitoring/grafana/provisioning monitoring/grafana/dashboards $(HELM_CHART)/files/monitoring/grafana/
@@ -273,8 +274,17 @@ k8s-status:          ## [N4] Pods, volumes et URL de la plateforme
 	@echo; kubectl get ingress -A -o custom-columns=NAMESPACE:.metadata.namespace,URL:.spec.rules[0].host
 
 k8s-expose:          ## [N4] Rend les interfaces accessibles depuis Windows : http://<ui>.localtest.me (laisser tourner)
-	@echo "Interfaces (port $(K8S_HTTP_PORT)) : kafka-ui, minio, generator, nifi/nifi, trino, airflow, superset, grafana, prometheus, openmetadata  ->  http://<nom>.localtest.me:$(K8S_HTTP_PORT)   (Ctrl+C pour arrêter)"
+	@echo "Interfaces (port $(K8S_HTTP_PORT)) : kafka-ui, minio, generator, nifi/nifi, trino, airflow, superset, grafana, prometheus, openmetadata, keycloak  ->  http://<nom>.localtest.me:$(K8S_HTTP_PORT)   (Ctrl+C pour arrêter)"
 	kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller $(K8S_HTTP_PORT):80 --address 127.0.0.1
+
+k8s-sso:             ## [N4] SSO Keycloak : URL, utilisateurs de démonstration et rôles (mot de passe : KEYCLOAK_DEMO_PASSWORD de .env)
+	@echo "Superset : http://superset.localtest.me:$(K8S_HTTP_PORT)  (bouton keycloak)   Console Keycloak : http://keycloak.localtest.me:$(K8S_HTTP_PORT)/admin (admin / KEYCLOAK_ADMIN_PASSWORD)"
+	@echo "  admin.groupe  group_admin         -> Admin Superset : tout"
+	@echo "  analyste.ci   country_analyst CI  -> 3 dashboards, Côte d'Ivoire uniquement"
+	@echo "  analyste.sn   country_analyst SN  -> 3 dashboards, Sénégal uniquement"
+	@echo "  conformite    compliance_officer  -> D2 Risque & Conformité (tables gold réglementaires)"
+	@echo "  lecteur       viewer              -> D1 et D3 en lecture seule, aucune donnée individuelle"
+	@kubectl get pods -n governance -l app.kubernetes.io/name=keycloak -o wide --no-headers 2>/dev/null || true
 
 k8s-uninstall:       ## [N4] Désinstalle la plateforme (les volumes de données sont conservés)
 	@read -p "Désinstaller la release $(K8S_RELEASE) (volumes conservés) ? [y/N] " ok && [ "$$ok" = "y" ] || { echo "annulé"; exit 1; }

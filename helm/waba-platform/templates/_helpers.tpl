@@ -194,6 +194,20 @@ trino://{{ .Values.superset.trinoUser }}@{{ include "waba.svc" (dict "ctx" . "do
 - {name: WABA_TRINO_URI, value: {{ include "waba.supersetTrinoUri" . | quote }}}
 - {name: SCARF_ANALYTICS, value: "false"}      # pas de télémétrie sortante
 - {name: SUPERSET_PORT, value: "8088"}          # port d'écoute de gunicorn (cf. enableServiceLinks)
+{{- if .Values.keycloak.enabled }}
+# SSO Keycloak (4.3) : URL vue par le navigateur, URL interne (appels serveur à serveur), secret du client OIDC
+- {name: KEYCLOAK_PUBLIC_URL, value: {{ include "waba.publicUrl" (dict "ctx" . "host" "keycloak") | quote }}}
+- {name: KEYCLOAK_INTERNAL_URL, value: "http://{{ include "waba.svc" (dict "ctx" . "domain" "governance" "name" "keycloak") }}:8080"}
+- {name: KEYCLOAK_REALM, value: {{ .Values.keycloak.realm | quote }}}
+- {name: SUPERSET_PUBLIC_URL, value: {{ include "waba.publicUrl" (dict "ctx" . "host" "superset") | quote }}}
+- name: SUPERSET_OIDC_CLIENT_SECRET
+  valueFrom: {secretKeyRef: {name: waba-secrets, key: SUPERSET_OIDC_CLIENT_SECRET}}
+{{- end }}
+{{- end -}}
+
+{{/* URL d'une interface vue depuis le navigateur : http://<host>.<domaine>:<port de make k8s-expose> */}}
+{{- define "waba.publicUrl" -}}
+http://{{ .host }}.{{ .ctx.Values.ingress.domain }}:{{ .ctx.Values.ingress.port }}
 {{- end -}}
 
 {{- define "waba.supersetMounts" -}}
@@ -251,4 +265,25 @@ spec:
         - name: OPENMETADATA_ADMIN_PASSWORD
           valueFrom: {secretKeyRef: {name: waba-secrets, key: OPENMETADATA_ADMIN_PASSWORD}}
       resources: {{- toYaml .Values.openmetadata.sync.resources | nindent 8 }}
+{{- end -}}
+
+{{/* Keycloak : configuration commune à l'import du realm et au serveur (aucun secret en clair) */}}
+{{- define "waba.keycloakEnv" -}}
+- {name: KC_DB, value: postgres}
+- {name: KC_DB_URL, value: "jdbc:postgresql://keycloak-db:5432/keycloak"}
+- {name: KC_DB_USERNAME, value: keycloak}
+- name: KC_DB_PASSWORD
+  valueFrom: {secretKeyRef: {name: waba-secrets, key: KEYCLOAK_DB_PASSWORD}}
+# URL publique (navigateur, émetteur « iss » des jetons) ; les appels internes au cluster
+# (http://keycloak.governance.svc.cluster.local:8080) reçoivent des URL internes (backchannel dynamique)
+- {name: KC_HOSTNAME, value: {{ include "waba.publicUrl" (dict "ctx" . "host" "keycloak") | quote }}}
+- {name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC, value: "true"}
+- {name: KC_HTTP_ENABLED, value: "true"}          # HTTP : plateforme locale ; production : HTTPS (KC_HTTPS_*)
+- {name: KC_HEALTH_ENABLED, value: "true"}        # /health/* sur le port de gestion 9000
+- {name: KC_METRICS_ENABLED, value: "true"}       # /metrics (Prometheus)
+- {name: KC_LOG_LEVEL, value: INFO}
+# Compte d'administration (realm master), créé au premier démarrage uniquement
+- {name: KC_BOOTSTRAP_ADMIN_USERNAME, value: admin}
+- name: KC_BOOTSTRAP_ADMIN_PASSWORD
+  valueFrom: {secretKeyRef: {name: waba-secrets, key: KEYCLOAK_ADMIN_PASSWORD}}
 {{- end -}}

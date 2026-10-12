@@ -476,3 +476,53 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
   marquées, pipelines vérifiés via l'API. Non testable localement : lignage (Elasticsearch requis) et connexion à
   Trino / Kafka (configuration validée par le SDK). Trouvé en test : dépendance `cachetools` manquante du paquet
   `openmetadata-ingestion` 1.10.14 (ajoutée à l'image), politique de mot de passe d'OpenMetadata (générateur adapté).
+
+## D33 — Keycloak : SSO OIDC et 4 rôles (Superset ; Trino en 4f-2)
+- **Déploiement** (namespace `governance`) : Keycloak 26.4.7 (image officielle `quay.io/keycloak/keycloak`) et sa
+  base PostgreSQL sur PVC (`keep`). URL publique `http://keycloak.localtest.me:8090` (console : `/admin`, compte
+  `admin` / `KEYCLOAK_ADMIN_PASSWORD`). HTTP uniquement parce que la plateforme est locale ; en production :
+  HTTPS de bout en bout (`sslRequired: external`, certificats sur l'Ingress).
+- **Realm « waba » as code** : `keycloak/gen_realm.py` génère `keycloak/waba-realm.json` (rôles, groupes, clients,
+  utilisateurs de démonstration). Un initContainer le ré-importe **en écrasement** à chaque démarrage du pod : le
+  dépôt est la source de vérité (une modification faite dans la console est perdue au redémarrage, comme pour les
+  dashboards Superset). Aucun secret dans le fichier : placeholders `${SUPERSET_OIDC_CLIENT_SECRET}`... remplacés
+  par Keycloak depuis les variables d'environnement (Secret `waba-secrets`). Fichier nommé `*-realm.json` : c'est
+  le nom attendu par `kc.sh import --dir` (sinon import « réussi » mais vide, vu en test local).
+- **4 rôles de realm** attribués par des **groupes fonctionnels** (`administrateurs` -> `group_admin`,
+  `analystes_pays` -> `country_analyst`, `conformite` -> `compliance_officer`, `lecteurs` -> `viewer`) ; le **pays**
+  d'un analyste est un groupe `pays_XX` (et non un attribut utilisateur : depuis Keycloak 24, le profil utilisateur
+  refuse les attributs non déclarés). Les jetons portent deux claims : `roles` (rôles effectifs) et `groups`
+  (groupes, dont `pays_XX`). Utilisateurs de démonstration (mot de passe `KEYCLOAK_DEMO_PASSWORD`) :
+  `admin.groupe`, `analyste.ci`, `analyste.sn`, `conformite`, `lecteur`.
+- **URL publique / URL interne** : le navigateur parle à `keycloak.localtest.me:8090` (Ingress), les applications
+  à `keycloak.governance.svc.cluster.local:8080`. Avec `KC_HOSTNAME` (URL publique) et
+  `KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true`, la découverte OIDC lue en interne annonce l'URL publique pour la page de
+  connexion et l'URL interne pour jetons / userinfo / clés ; l'émetteur (`iss`) reste toujours l'URL publique.
+  Aucune résolution de `*.localtest.me` n'est donc nécessaire dans les pods.
+- **Superset** : `AUTH_OAUTH` (Authlib, PKCE) ; rôles Superset déduits à **chaque connexion** des claims
+  (`AUTH_ROLES_SYNC_AT_LOGIN`) : retirer un rôle dans Keycloak suffit. Correspondance et droits
+  (`superset/dashboards/apply_security.py`, rejoué à chaque démarrage, idempotent) :
+
+  | Keycloak | Superset | Dashboards | Données |
+  |---|---|---|---|
+  | group_admin | Admin | les 3 + SQL Lab | tout |
+  | country_analyst + pays_XX | WABA_Analyste + WABA_Pays_XX | les 3, exploration | lignes du pays XX (RLS) |
+  | compliance_officer | WABA_Conformite | D2 Risque & Conformité | jeux de données gold réglementaires, tous pays |
+  | viewer | WABA_Lecteur | D1, D3 | agrégats uniquement : ni exploration, ni « drill to detail », ni export ; pas de D2 (événements AML individuels) |
+
+  Filtres pays : un filtre RLS `country_code = 'XX'` par rôle `WABA_Pays_XX`, plus un filtre `1 = 0` pour le rôle
+  analyste, dans le même groupe (combinés par OR) : un analyste sans groupe pays ne voit **aucune** ligne
+  (sécurité par défaut). Le filtre natif « Pays » des dashboards ne propose alors que son pays. Aucun rôle WABA n'a
+  SQL Lab : les filtres RLS ne s'appliquent pas au SQL libre. Données sensibles (IBAN, numéros de compte, montants
+  individuels de sinistres) : aucun jeu de données Superset ne les expose (agrégats gold, identifiants hachés ou
+  masqués en silver, cf. D3) ; l'accès direct aux tables passe par Trino (4f-2).
+- **Pièges évités** (vérifiés en test local) : derrière l'Ingress, `X-Forwarded-Port` vaut 80 (port interne du
+  contrôleur NGINX) alors que le navigateur est sur 8090 : `PROXY_FIX_CONFIG` ignore ce port (`x_port: 0`), sinon
+  l'URL de retour OIDC devient `:80` et Keycloak la refuse. Déconnexion : Superset renvoie vers la déconnexion
+  Keycloak (sinon la session SSO reconnecte aussitôt le même compte). Tampon d'en-têtes NGINX agrandi (16k) pour
+  les cookies et jetons OIDC.
+- **Validation avant livraison** : Keycloak 26.4.7 local (PostgreSQL 16) + Superset 4.1.1 (FAB 4.5.0, versions de
+  l'image) derrière un simulateur d'Ingress (mêmes en-têtes X-Forwarded-*) : connexion SSO des 5 utilisateurs avec
+  un navigateur (Playwright), rôles obtenus, dashboards visibles, pays renvoyés par l'API de données
+  (`analyste.ci` -> CI seulement, `analyste.sn` -> SN, `conformite` -> D2 seul, `lecteur` -> D1/D3 sans
+  exploration), ré-import du realm et `apply_security.py` rejoués (idempotence).
