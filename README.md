@@ -1,193 +1,279 @@
-# WABA Group - Plateforme Analytique Financière Multi-Pays
+# WABA Group — Plateforme analytique financière multi-pays
 
-Challenge Data Engineer Artefact : un Data Lakehouse (batch + streaming) pour un groupe
-fictif de banque-assurance présent dans 8 pays d'Afrique de l'Ouest.
+Challenge Data Engineer Artefact : un Data Lakehouse batch + streaming pour un groupe fictif de banque-assurance
+(banque, assurance, mobile money, microfinance) présent dans 8 pays d'Afrique de l'Ouest (7 en zone UEMOA + Ghana).
 
-> **Avancement** : Niveau 1 ✅ validé · Niveau 2 ✅ validé (Airflow + médaillon, backfill par pays) · Niveau 3 ✅ streaming (NiFi, Kafka, Spark Streaming, Lambda) · Niveau 4 : à venir
-> (voir [docs/PLAN_7_JOURS.md](docs/PLAN_7_JOURS.md)).
+> **Avancement** : niveaux 1, 2, 3 et 4 réalisés et validés.
+> **Write-up technique** : [docs/WRITEUP.md](docs/WRITEUP.md) ([PDF](docs/WRITEUP.pdf)) ·
+> **Journal des décisions** (34 décisions, problèmes rencontrés) : [docs/DECISIONS.md](docs/DECISIONS.md)
 
-## Architecture — Niveau 1
+![Architecture](docs/img/architecture.svg)
 
-```
- Streamlit (générateur) ──CSV──► MinIO raw-landing ──► Spark (validation, MERGE) ──► Iceberg lakehouse.raw.*
-                                        │                         │                          │
-                                        └──── archive ◄───────────┘                     Trino (SQL)
-                                                          catalogue Iceberg REST (partagé Spark/Trino)
-```
-
-| Service | Rôle | URL locale |
+| Niveau | Contenu | Environnement |
 |---|---|---|
-| `generator` | Streamlit : génération des données simulées (one-time / continu) | http://localhost:8501 |
-| `minio` | Stockage objet S3 : `raw-landing`, `lakehouse`, `archive` | http://localhost:9001 (console) |
-| `iceberg-rest` | Catalogue Iceberg (REST) partagé par Spark et Trino | http://localhost:8181 |
-| `spark-master` / `spark-worker` | Traitement PySpark | http://localhost:8090 |
-| `trino` | Requêtes SQL sur les tables Iceberg | http://localhost:8088 (`TRINO_PORT`) |
+| 1 | Générateur Streamlit, MinIO, ingestion Spark → Iceberg (`raw`), Trino | Docker Compose |
+| 2 | Airflow, médaillon `bronze` → `silver` → `gold` (7 KPIs), rapport réglementaire J+1, backfill par pays | Docker Compose |
+| 3 | NiFi → Kafka → Spark Structured Streaming (fraude, AML, liquidité), requête Lambda Trino | Docker Compose |
+| 4 | Kubernetes (Helm), Spark Operator, Superset, Keycloak (SSO + 4 rôles), OpenMetadata, Prometheus / Loki / Grafana | minikube |
 
-## Niveau 2 — Orchestration et architecture médaillon
+---
 
-```
-raw-landing ─► raw.* ─► bronze.* ─► silver.* ─► gold.* (7 KPIs) ─► gold.regulatory_daily_report (J+1)
-   └──────────── dag_ingest_raw ───┘   dag_bronze_to_silver   dag_silver_to_gold   dag_regulatory_report
-```
+## 1. Prérequis
 
-| Couche | Contenu | Partitionnement |
+Versions utilisées pour la validation (Windows 11 + WSL2) :
+
+| Outil | Version testée | Remarque |
 |---|---|---|
-| `bronze.*` | copie validée de raw, sans transformation métier | pays + date d'ingestion |
-| `silver.*` | dédoublonné, joint aux référentiels, montants en EUR, nulls normalisés, aberrants signalés | pays + mois |
-| `gold.*` | 7 KPIs + rapport réglementaire | pays (+ date de rapport) |
+| WSL2 | Ubuntu 24.04 | cloner le dépôt **dans WSL** (`~/`), pas dans `/mnt/c` (très lent) |
+| Docker Engine | 29.2 (Compose v2) | |
+| minikube | 1.39 | pilote `docker` |
+| kubectl | 1.37 | |
+| Helm | 3.22 | |
+| Python | 3.12 (+ `python3-venv`) | scripts `make env`, `make k8s-trino-sso` |
+| make, git | récents | |
 
-| DAG | Déclenchement | Rôle |
-|---|---|---|
-| `dag_ingest_raw` | toutes les 10 min (si nouveaux fichiers) | landing → raw → bronze |
-| `dag_bronze_to_silver` | après `dag_ingest_raw` | référentiels puis 4 flux en Silver |
-| `dag_silver_to_gold` | après `dag_bronze_to_silver` | 7 tables Gold |
-| `dag_regulatory_report` | chaque jour 00h30 UTC | agrégats BCEAO/CIMA de J-1 + export CSV |
+**Ressources** : 8 cœurs et 24 Go de mémoire pour WSL ; minikube reçoit toute cette capacité (validé : nœud à
+8 CPU / 23,5 Gio, environ 18 Go réellement utilisés au niveau 4). Fichier
+`%UserProfile%\.wslconfig` côté Windows, puis `wsl --shutdown` :
 
-Interface Airflow : http://localhost:8082 (identifiants `AIRFLOW_ADMIN_*` dans `.env`).
-Backfill d'un pays : *Trigger DAG w/ config* → `{"country_code": "SN"}`.
-Exécution manuelle sans Airflow : `make bronze`, `make silver`, `make gold`, `make report DATE=2026-06-30`.
-Contrôles : `docker compose exec -T trino trino --catalog iceberg < sql/level2_checks.sql`
-(backfill : `sql/level2_backfill_check.sql`, à lancer avant et après).
-
-## Niveau 3 — Streaming temps réel et architecture Lambda
-
-```
-MinIO raw-landing ─► NiFi ─► raw-* ─► Job 1 (Spark) ─┬─► silver-* (Kafka) ─► Job 2 (Spark) ─┬─► gold-fraud-alerts
-  (ListS3 10 s)   1 ligne CSV           validation,   │   + silver.rt_* (Iceberg)  fenêtres    ├─► gold-aml-events
-                  = 1 message JSON      dédoublonnage └─► dlq-financial-events     5 min/1 min └─► gold-liquidity-alerts
-                                        10 min, EUR                                 (+ gold.rt_* Iceberg)
-Trino : iceberg.gold.* (batch) ⨝ kafka.default."silver-bank-transactions" (temps réel) = requête Lambda
+```ini
+[wsl2]
+memory=24GB
+processors=8
 ```
 
-| Élément | Fichiers | Points clés |
-|---|---|---|
-| Kafka 3.9 (KRaft) + Kafka UI | `infra/kafka/create-topics.sh` | 11 topics créés par script, 3 partitions, clé = pays |
-| NiFi 1.28 | `infra/nifi/deploy_flow.py` | flux « as code » via l'API REST, back-pressure, erreurs -> DLQ |
-| Job 1 raw -> silver | `spark/jobs/stream_raw_to_silver.py`, `common/streaming.py` | règles qualité du batch, DLQ, dédoublonnage 10 min, double sink |
-| Job 2 silver -> gold | `spark/jobs/stream_fraud_aml.py`, `common/fraud.py` | 3 règles de fraude, AML, liquidité ; une rafale = une alerte |
-| Requête Lambda | `trino/catalog/kafka.properties`, `trino/kafka/*.json`, `sql/level3_lambda.sql` | énoncé + version sans double comptage |
+**Accès Internet** : images Docker Hub, quay.io (Keycloak), docker.getcollate.io (OpenMetadata), docker.elastic.co,
+et le dépôt Helm de Spark Operator (première installation uniquement).
 
-Démarrage et tests :
+## 2. Variables d'environnement et secrets
+
+Aucun secret n'est versionné. [`.env.example`](.env.example) liste **toutes** les variables avec des valeurs
+d'exemple (`change-me-...`) et un commentaire pour chacune.
 
 ```bash
-make up-streaming          # stack + Kafka, Kafka UI (http://localhost:8085), NiFi (http://localhost:8089/nifi), jobs streaming
-make nifi-deploy           # déploie le flux NiFi
-docker compose exec generator python -m waba_gen stream --rows-per-tick 2000 --duration 90   # flux continu
-make dlq-test              # message invalide -> dlq-financial-events
-make alert-test            # rafale + AML + liquidité horodatées maintenant
-make gold-peek             # nombre de messages gold-*
-make lambda                # requête Lambda unifiée (Trino)
-make check3                # latence NiFi -> Kafka, double sink, DLQ, alertes, vérité terrain
+make env     # crée .env à partir de .env.example ; chaque « change-me » devient un secret aléatoire
+             # relancé plus tard, il ajoute seulement les variables manquantes (valeurs existantes conservées)
 ```
 
-Journaux : `make stream-logs` (job 1), `make stream2-logs` (job 2). Décisions : D18 à D24.
+Pour Kubernetes, `make k8s-secrets` (appelé par `make k8s-install`) génère `helm/values-secrets.yaml` (droits 600,
+ignoré par git) : le chart en fait un Secret `waba-secrets` par namespace, limité aux clés utiles.
 
-## Prérequis
+---
 
-| Outil | Version testée |
+## 3. Déploiement Kubernetes (niveau 4) — du clone aux premières requêtes Trino
+
+### 3.1 Cluster
+
+```bash
+git clone https://github.com/mkindo19/waba-lakehouse.git && cd waba-lakehouse
+make env
+
+minikube start --driver=docker --cpus=max --memory=max --force   # toute la capacité de WSL ; --force : root sous WSL
+minikube addons enable ingress
+minikube addons enable metrics-server
+kubectl get nodes                       # minikube   Ready
+```
+
+Après un redémarrage de WSL ou du poste : `make k8s-start`.
+
+### 3.2 Images et installation
+
+```bash
+make k8s-images      # construit les 5 images maison (générateur, Spark, Airflow, Superset, synchro OpenMetadata)
+                     # et les charge dans minikube (~5 à 10 min la première fois)
+make k8s-lint        # optionnel : helm lint + rendu complet du chart, sans rien installer
+make k8s-install     # un seul « helm upgrade --install » : toute la plateforme (~10 à 15 min la première fois)
+make k8s-status      # pods, volumes, URL
+```
+
+`make k8s-install` enchaîne : copie des scripts dans le chart (`k8s-files`), génération des secrets
+(`k8s-secrets`), CRD de Spark Operator (`k8s-crds`), puis l'installation. Il est **idempotent** : on le relance
+après toute modification (code, DAG, dashboard, realm Keycloak...).
+
+> Au premier démarrage, le job streaming « fraude / AML » redémarre en boucle tant que les référentiels
+> `silver.customers` / `silver.accounts` n'existent pas : c'est attendu, il démarre seul après l'étape 3.4.
+
+### 3.3 Accès aux interfaces
+
+Dans un **terminal dédié** (à laisser tourner) :
+
+```bash
+make k8s-expose      # port-forward de l'Ingress : http://<nom>.localtest.me:8090 et https://trino.localtest.me:8443
+```
+
+`*.localtest.me` est un DNS public qui répond 127.0.0.1 : rien à modifier dans le fichier hosts.
+
+| Interface | URL | Connexion |
+|---|---|---|
+| Générateur (Streamlit) | http://generator.localtest.me:8090 | — |
+| MinIO | http://minio.localtest.me:8090 | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` |
+| NiFi | http://nifi.localtest.me:8090/nifi | — |
+| Kafka UI | http://kafka-ui.localtest.me:8090 | — |
+| Airflow | http://airflow.localtest.me:8090 | `AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD` |
+| **Superset** | http://superset.localtest.me:8090 | bouton **keycloak** (comptes ci-dessous) |
+| **Trino** | https://trino.localtest.me:8443/ui/ | Keycloak (certificat auto-signé : « Continuer ») |
+| Grafana | http://grafana.localtest.me:8090 | `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` |
+| Prometheus | http://prometheus.localtest.me:8090 | — |
+| OpenMetadata | http://openmetadata.localtest.me:8090 | `admin@open-metadata.org` / `OPENMETADATA_ADMIN_PASSWORD` |
+| Keycloak (console) | http://keycloak.localtest.me:8090/admin | `admin` / `KEYCLOAK_ADMIN_PASSWORD` |
+
+Les valeurs se lisent dans `.env` (`grep NOM_VARIABLE .env`).
+
+**Comptes de démonstration Keycloak** (mot de passe commun `KEYCLOAK_DEMO_PASSWORD`, rappel : `make k8s-sso`) :
+
+| Utilisateur | Rôle | Superset | Trino |
+|---|---|---|---|
+| `admin.groupe` | group_admin | tout, SQL Lab | tous catalogues |
+| `analyste.ci` / `analyste.sn` | country_analyst | 3 dashboards, **son pays uniquement** | silver + gold filtrés sur son pays |
+| `conformite` | compliance_officer | D2 Risque & Conformité | 9 tables gold réglementaires |
+| `lecteur` | viewer | D1 et D3 en lecture seule | 7 tables gold agrégées, aucune donnée sensible |
+
+Pour changer de compte : fermer **toutes** les fenêtres privées (sinon la session Keycloak reconnecte le même
+utilisateur).
+
+### 3.4 Données et pipelines
+
+```bash
+make k8s-referentials    # référentiels : 500 000 clients, 800 000 comptes, agences, produits (~1 min)
+make k8s-generate        # un trimestre de transactions, 8 pays, 4 flux, dans MinIO raw-landing
+make k8s-dags-on         # active la chaîne batch : ingest_raw (toutes les 10 min) -> bronze/silver -> gold
+make k8s-dag DAG=dag_ingest_raw          # déclenchement immédiat (sinon au prochain passage)
+make k8s-dag-runs        # suivi : runs des DAGs et SparkApplication (chaîne complète ~20 à 30 min)
+make k8s-dag DAG=dag_regulatory_report   # rapport réglementaire BCEAO / CIMA de J-1
+```
+
+Backfill d'un seul pays : dans Airflow, *Trigger DAG w/ config* → `{"country_code": "SN"}`.
+
+Temps réel (NiFi → Kafka → 2 jobs Spark Streaming, déployés et démarrés par l'installation) :
+
+```bash
+make k8s-stream ROWS=2000 DURATION=300   # flux continu de transactions pendant 5 min
+make k8s-alert-test COUNTRY=SN           # rafale de retraits + AML + liquidité, horodatées maintenant
+make k8s-gold-peek                       # messages dans gold-fraud-alerts / gold-aml-events / gold-liquidity-alerts
+make k8s-lag                             # retard des jobs Spark (groupes de supervision waba-spark.*)
+make k8s-spark                           # état des applications Spark ; journaux : make k8s-spark-logs APP=stream-fraud-aml
+```
+
+### 3.5 Premières requêtes Trino
+
+Compte de service (dans le cluster, sans Keycloak) :
+
+```bash
+make k8s-trino
+```
+```sql
+SHOW SCHEMAS;                                            -- raw, bronze, silver, gold
+SELECT country_code, period_month, round(npl_ratio * 100, 2) AS npl_pct
+FROM gold.npl_ratio_by_country WHERE loan_type = 'ALL' ORDER BY 1, 2;
+SELECT country_code, count(*) AS alertes FROM gold.rt_fraud_alerts GROUP BY 1;
+```
+
+Requêtes de contrôle par niveau : [`sql/`](sql) (par exemple `sql/level3_lambda.sql`, la requête Lambda qui unit
+Iceberg et Kafka).
+
+Avec un compte Keycloak (vérifie les droits par rôle) :
+
+```bash
+make k8s-trino-sso       # affiche une URL : l'ouvrir dans une fenêtre privée et se connecter (ex. analyste.ci)
+```
+```
+[OK]      Identité vue par Trino : analyste.ci ['pays_CI', 'analystes_pays']
+[OK]      Silver : transactions par pays (filtre pays) : CI 26614
+[REFUSÉ]  Catalogue Kafka (topics bruts) : accès refusé
+```
+
+### 3.6 Gouvernance et observabilité
+
+- **OpenMetadata** : la découverte (tables Trino, topics Kafka) et la gouvernance as code
+  ([governance/catalog.yaml](governance/catalog.yaml) : équipes, glossaire, tags PII et réglementaires, lignage)
+  sont appliquées à chaque `make k8s-install` et chaque nuit ; à la demande : `make k8s-om-sync`.
+- **Grafana** : dashboard « santé des pipelines » et 3 alertes (job fraude en erreur > 5 min, retard AML > 5000,
+  rapport réglementaire absent à 06h00 UTC). Démonstration :
+  ```bash
+  make k8s-demo-break                       # casse le job fraude -> alerte « job en erreur » après 5 min
+  make k8s-stream ROWS=3000 DURATION=600    # le retard AML dépasse 5000 -> 2e alerte
+  make k8s-demo-repair                      # rétablit le job : retard rattrapé, alertes résolues
+  ```
+
+### 3.7 Arrêt et désinstallation
+
+```bash
+minikube stop            # arrêt (tout est conservé) ; reprise : make k8s-start puis make k8s-expose
+make k8s-uninstall       # désinstalle la plateforme ; les volumes de données sont conservés (PVC « keep »)
+```
+
+---
+
+## 4. Docker Compose (niveaux 1 à 3)
+
+Environnement plus léger, utilisé pour développer les niveaux 1 à 3. Ne pas le faire tourner en même temps que
+minikube (mémoire).
+
+```bash
+make env && make up                 # stack batch : MinIO, catalogue Iceberg, Spark, Trino, Airflow, générateur
+make referentials && make generate  # données (ou http://localhost:8501)
+make ingest                         # raw-landing -> raw.* (niveau 1) ; make bronze / silver / gold (niveau 2)
+make trino                          # client SQL ; contrôles : sql/level1_checks.sql, sql/level2_checks.sql
+make up-streaming && make nifi-deploy   # niveau 3 : Kafka, NiFi, jobs streaming
+make alert-test && make lambda && make check3
+```
+
+| Service | URL locale |
 |---|---|
-| Docker Engine / Docker Desktop | ≥ 24 (Compose v2) |
-| RAM allouée à Docker | ≥ 12 Go pour le niveau 1 (32 Go conseillés pour l'ensemble) |
-| make, openssl, git | versions récentes |
+| Générateur | http://localhost:8501 |
+| MinIO | http://localhost:9001 |
+| Airflow | http://localhost:8082 |
+| Kafka UI | http://localhost:8085 |
+| NiFi | http://localhost:8089/nifi |
+| Trino | http://localhost:8088 |
 
-**Windows (WSL2)** — deux réglages importants :
+`make help` liste toutes les commandes (celles du niveau 4 sont préfixées `[N4]`).
 
-1. Cloner le dépôt **dans WSL** (`cd ~ && git clone ...`), pas dans `/mnt/c/...` : les volumes
-   montés depuis Windows sont très lents.
-2. Donner assez de mémoire à WSL : fichier `%UserProfile%\.wslconfig` puis `wsl --shutdown` :
-   ```ini
-   [wsl2]
-   memory=24GB
-   processors=8
-   ```
+---
 
-## Démarrage (from scratch)
+## 5. Dépannage
 
-```bash
-git clone <url-du-depot> waba-lakehouse && cd waba-lakehouse
-
-make env          # crée .env depuis .env.example avec des secrets aléatoires
-make up           # build + démarrage de toute la stack (≈ 5 min au premier lancement)
-make ps           # tous les services doivent être "healthy" (minio-init : "exited (0)")
-```
-
-Sans `make` : `cp .env.example .env`, remplacer les valeurs `change-me`, puis
-`docker compose up -d --build`.
-
-### 1. Générer les données
-
-Ouvrir http://localhost:8501 :
-
-1. onglet **Référentiels** → *Générer les référentiels* (500 000 clients, 800 000 comptes,
-   200 agences, 50 produits ; ≈ 30 s) ;
-2. onglet **Génération one-time** → choisir pays / lignes métier / période → *Générer* ;
-3. onglet **Génération continue** → *Démarrer* : un lot toutes les 10 à 60 s.
-
-Équivalent en ligne de commande : `make referentials` puis `make generate`.
-
-### 2. Ingérer dans Iceberg
-
-```bash
-make ingest                                     # tous les jeux de données, tous les pays
-make ingest DATASET=bank_transactions COUNTRY=CI   # un seul flux, un seul pays
-```
-
-### 3. Interroger avec Trino
-
-```bash
-make trino
-trino:raw> SHOW TABLES;
-```
-
-Les requêtes de contrôle (soldes par pays, volumes, comptages, intégrité, idempotence, PII)
-sont dans [sql/level1_checks.sql](sql/level1_checks.sql).
-
-### 4. Vérifier l'idempotence
-
-```bash
-make replay       # remet les fichiers archivés dans raw-landing
-make ingest       # ré-ingestion
-# puis dans Trino : la requête n°5 de sql/level1_checks.sql doit renvoyer 0 ligne
-```
-
-## Structure du dépôt
-
-```
-generator/          Application Streamlit + package waba_gen (génération, dépôt MinIO) + tests
-spark/              Image Spark (Iceberg, S3) et jobs PySpark
-  jobs/ingest_raw.py      Ingestion raw-landing -> lakehouse.raw.*
-  jobs/common/            Schémas, règles qualité, pseudonymisation, archivage, logs JSON
-trino/catalog/      Catalogue Iceberg de Trino
-infra/minio/        Initialisation des buckets et du compte applicatif
-sql/                Requêtes de vérification
-docs/               Plan, journal des décisions, write-up
-```
-
-## Données générées
-
-| Fichier | Volume par défaut | Chemin dans `raw-landing` |
+| Symptôme | Cause | Solution |
 |---|---|---|
-| customers / accounts / branches / products | 500 k / 800 k / 200 / 50 | `referentials/<nom>/<nom>.csv` |
-| Transactions bancaires | 10 000 | `bank_transactions/<CC>/bank_txn_<CC>_<AAAAMMJJ>_<NN>.csv` |
-| Opérations d'assurance | 5 000 | `insurance_operations/<CC>/insurance_ops_...csv` |
-| Paiements mobile money | 20 000 | `mobile_money_payments/<CC>/mobile_money_...csv` |
-| Remboursements de crédit | 5 000 | `loan_repayments/<CC>/loan_repayments_...csv` |
+| `ErrImageNeverPull` | image maison non chargée dans minikube | `make k8s-images` |
+| Pod `Pending` (CPU insuffisant) | réservations CPU du nœud | `kubectl describe node minikube` ; arrêter une SparkApplication terminée (`make k8s-spark`) |
+| Superset : « Invalid parameter: redirect_uri » | interface ouverte sur un autre port que 8090 | passer par `make k8s-expose` (port 8090) |
+| Trino : page « authentication disabled » | ouverture en HTTP | utiliser **https**://trino.localtest.me:**8443** |
+| Keycloak reconnecte toujours le même utilisateur | session SSO du navigateur | fermer toutes les fenêtres privées |
+| `make k8s-trino-sso` : « ensurepip is not available » | module venv absent | `apt install -y python3.12-venv` puis relancer |
+| Un DAG suivant reste `queued` | DAG en pause | `make k8s-dags-on` |
+| Volumes Docker vides ou périmés (Compose sous WSL) | montage non rafraîchi | `docker compose up -d --force-recreate <service>` |
 
-Garanties : clés étrangères toujours valides (tirées dans les référentiels du même pays), XOF en
-zone UEMOA et GHS au Ghana, statuts ~92/5/3 %, NPL 3-8 % et loss ratio 50-85 % selon les pays,
-quelques anomalies injectées pour tester la détection de fraude.
+Autres cas vécus et leur analyse : [docs/DECISIONS.md](docs/DECISIONS.md).
 
-## Qualité et sécurité
+---
 
-- **Aucun secret dans le code** : tout passe par `.env` (non versionné) ; voir `.env.example`.
-- **Compte MinIO dédié** aux applications (le compte root ne sert qu'à l'administration).
-- **Données personnelles** : IBAN et numéros de compte pseudonymisés (SHA-256 salé) et masqués
-  dès l'écriture dans Iceberg.
-- **Rejets tracés** : chaque ligne invalide est conservée dans `raw.rejected_records` avec son
-  motif (format, devise, clé orpheline, montant...).
-- **Logs JSON structurés** dans tous les composants Python.
-- Tests : `make test` · style PEP 8 : `make lint` (ruff).
+## 6. Structure du dépôt
 
-## Décisions et limites connues
+```
+generator/            Application Streamlit + package waba_gen (référentiels, flux, dépôt MinIO) + tests
+spark/                Image Spark (Iceberg, S3, Kafka) et jobs PySpark
+  jobs/                 ingest_raw, raw_to_bronze, bronze_to_silver, silver_to_gold, regulatory_report,
+                        stream_raw_to_silver, stream_fraud_aml
+  jobs/common/          schémas, qualité, pseudonymisation, transformations (fonctions pures testées), supervision
+  tests/                tests unitaires (pytest)
+airflow/dags/         4 DAGs + opérateur SparkApplication (Kubernetes) / SparkSubmit (Compose)
+infra/                Initialisation MinIO, topics Kafka, flux NiFi (as code), migration du catalogue Iceberg
+trino/                Catalogues, description des topics Kafka, règles d'accès (security/rules.json)
+superset/             Image, configuration (SSO Keycloak), dashboards et rôles as code
+keycloak/             Realm « waba » as code (gen_realm.py -> waba-realm.json)
+governance/           Synchronisation OpenMetadata et gouvernance as code (catalog.yaml)
+monitoring/           Prometheus, Loki, Promtail, StatsD, Grafana (dashboard et alertes as code)
+helm/waba-platform/   Chart Helm unique (5 namespaces) ; values-secrets.yaml généré, ignoré par git
+scripts/              Génération de .env et des secrets Helm, démonstration SSO Trino
+sql/                  Requêtes de contrôle par niveau
+docs/                 Write-up, journal des décisions, schéma d'architecture
+```
 
-Voir [docs/DECISIONS.md](docs/DECISIONS.md).
+## 7. Qualité et sécurité
+
+- Aucun secret dans le dépôt : `.env` et `helm/values-secrets.yaml` sont générés et ignorés par git.
+- IBAN et numéros de compte pseudonymisés (SHA-256 salé) et masqués dès la première écriture Iceberg.
+- Lignes invalides conservées avec leur motif (`raw.rejected_records`, topic `dlq-financial-events`).
+- Journaux JSON structurés dans les composants Python ; tests : `make test`, `make test-spark` ; style : `make lint`.
+- SSO Keycloak et droits par rôle sur Superset et Trino ; PII taguées et lignage dans OpenMetadata.
