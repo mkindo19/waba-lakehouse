@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 640" font-family="Helvetica, Arial, sans-serif" font-size="12">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <style>
+      .ns{fill:#f8fafc;stroke:#cbd5e1;stroke-dasharray:4 3}
+      .nst{fill:#64748b;font-size:11px;font-weight:bold;letter-spacing:.5px}
+      .b{stroke-width:1.2;rx:6}
+      .t{font-weight:bold;fill:#0f172a}
+      .s{fill:#334155;font-size:10.5px}
+      .l{stroke:#475569;stroke-width:1.4;fill:none;marker-end:url(#a)}
+      .lr{stroke:#c2410c;stroke-width:1.4;fill:none;marker-end:url(#a)}
+      .lb{stroke:#1d4ed8;stroke-width:1.4;fill:none;marker-end:url(#a)}
+      .lab{fill:#475569;font-size:10px;font-style:italic}
+    </style>
+  </defs>
+
+  <!-- Namespaces -->
+  <rect class="ns" x="10" y="40" width="250" height="380" rx="8"/>
+  <text class="nst" x="20" y="58">INGESTION</text>
+  <rect class="ns" x="275" y="40" width="470" height="380" rx="8"/>
+  <text class="nst" x="285" y="58">PROCESSING</text>
+  <rect class="ns" x="760" y="40" width="330" height="380" rx="8"/>
+  <text class="nst" x="770" y="58">SERVING</text>
+  <rect class="ns" x="10" y="440" width="535" height="190" rx="8"/>
+  <text class="nst" x="20" y="458">GOVERNANCE</text>
+  <rect class="ns" x="555" y="440" width="535" height="190" rx="8"/>
+  <text class="nst" x="565" y="458">MONITORING</text>
+  <text x="550" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a">WABA Group — Lakehouse sur Kubernetes (minikube, chart Helm unique, 5 namespaces)</text>
+
+  <!-- Ingestion -->
+  <rect class="b" x="25" y="75" width="220" height="50" fill="#fef3c7" stroke="#d97706"/>
+  <text class="t" x="35" y="96">Générateur (Streamlit)</text>
+  <text class="s" x="35" y="113">8 pays · 4 entités · référentiels + flux</text>
+
+  <rect class="b" x="25" y="215" width="220" height="50" fill="#ffedd5" stroke="#c2410c"/>
+  <text class="t" x="35" y="236">NiFi 1.28 (flux as code)</text>
+  <text class="s" x="35" y="253">ListS3 → CSV→JSON → Kafka, DLQ</text>
+
+  <rect class="b" x="25" y="300" width="220" height="100" fill="#ffedd5" stroke="#c2410c"/>
+  <text class="t" x="35" y="321">Kafka 3.9 (KRaft)</text>
+  <text class="s" x="35" y="338">raw-* · silver-* · gold-* · DLQ</text>
+  <text class="s" x="35" y="354">3 partitions, clé = country_code</text>
+  <text class="s" x="35" y="370">topics créés par script</text>
+
+  <!-- Processing -->
+  <rect class="b" x="290" y="75" width="200" height="50" fill="#e0f2fe" stroke="#0369a1"/>
+  <text class="t" x="300" y="96">MinIO (S3)</text>
+  <text class="s" x="300" y="113">raw-landing · lakehouse · archive</text>
+
+  <rect class="b" x="290" y="145" width="440" height="60" fill="#dbeafe" stroke="#1d4ed8"/>
+  <text class="t" x="300" y="166">Batch : Airflow 2.10 → SparkApplication (Spark Operator)</text>
+  <text class="s" x="300" y="184">raw → bronze → silver → gold (7 KPIs) → rapport réglementaire J+1</text>
+  <text class="s" x="300" y="199">MERGE idempotent · overwritePartitions par pays · backfill sélectif</text>
+
+  <rect class="b" x="290" y="225" width="440" height="60" fill="#ffedd5" stroke="#c2410c"/>
+  <text class="t" x="300" y="246">Streaming : Spark Structured Streaming (2 jobs)</text>
+  <text class="s" x="300" y="264">Job 1 : validation, dédoublonnage 10 min, EUR → silver-* + silver.rt_*</text>
+  <text class="s" x="300" y="279">Job 2 : fraude (rafales, pays inhabituel, sinistres), AML, liquidité → gold-*</text>
+
+  <rect class="b" x="290" y="305" width="440" height="86" fill="#ede9fe" stroke="#6d28d9"/>
+  <text class="t" x="300" y="326">Apache Iceberg (tables dans MinIO lakehouse)</text>
+  <text class="s" x="300" y="344">raw · bronze · silver · gold (+ silver.rt_*, gold.rt_* temps réel)</text>
+  <text class="s" x="300" y="360">Catalogue REST partagé Spark / Trino, base PostgreSQL</text>
+  <text class="s" x="300" y="376">IBAN / n° de compte : hash SHA-256 salé + masque dès raw</text>
+
+  <!-- Serving -->
+  <rect class="b" x="775" y="145" width="300" height="80" fill="#dcfce7" stroke="#15803d"/>
+  <text class="t" x="785" y="166">Trino 458</text>
+  <text class="s" x="785" y="184">catalogues iceberg + kafka (requête Lambda)</text>
+  <text class="s" x="785" y="200">OAuth2 Keycloak (HTTPS Ingress)</text>
+  <text class="s" x="785" y="216">règles par groupe + filtre pays</text>
+
+  <rect class="b" x="775" y="275" width="300" height="80" fill="#dcfce7" stroke="#15803d"/>
+  <text class="t" x="785" y="296">Superset 4.1</text>
+  <text class="s" x="785" y="314">3 dashboards as code (D1, D2, D3)</text>
+  <text class="s" x="785" y="330">SSO Keycloak · rôles WABA_* · RLS pays</text>
+
+  <rect class="b" x="775" y="75" width="300" height="45" fill="#f1f5f9" stroke="#64748b"/>
+  <text class="t" x="785" y="95">Ingress NGINX — *.localtest.me</text>
+  <text class="s" x="785" y="111">HTTP :8090 · HTTPS :8443 (Trino)</text>
+
+  <!-- Governance -->
+  <rect class="b" x="25" y="475" width="245" height="140" fill="#fce7f3" stroke="#be185d"/>
+  <text class="t" x="35" y="496">Keycloak 26 (realm as code)</text>
+  <text class="s" x="35" y="515">OIDC pour Superset et Trino</text>
+  <text class="s" x="35" y="531">4 rôles : group_admin, country_analyst,</text>
+  <text class="s" x="35" y="546">compliance_officer, viewer</text>
+  <text class="s" x="35" y="562">groupes pays_XX → filtre pays</text>
+  <text class="s" x="35" y="578">ré-import en écrasement au démarrage</text>
+
+  <rect class="b" x="285" y="475" width="245" height="140" fill="#fce7f3" stroke="#be185d"/>
+  <text class="t" x="295" y="496">OpenMetadata 1.10</text>
+  <text class="s" x="295" y="515">découverte Trino + Kafka (Job/CronJob)</text>
+  <text class="s" x="295" y="531">PII taguées sur toutes les couches</text>
+  <text class="s" x="295" y="546">glossaire, propriétaires, 11 tables gold</text>
+  <text class="s" x="295" y="562">lignage 53 arêtes (DAGs, jobs, topics)</text>
+  <text class="s" x="295" y="578">gouvernance as code (catalog.yaml)</text>
+
+  <!-- Monitoring -->
+  <rect class="b" x="570" y="475" width="245" height="140" fill="#fef9c3" stroke="#a16207"/>
+  <text class="t" x="580" y="496">Prometheus 3 + exporters</text>
+  <text class="s" x="580" y="515">Spark (servlet), Kafka (lag), NiFi,</text>
+  <text class="s" x="580" y="531">Airflow (StatsD), Trino, Keycloak</text>
+  <text class="t" x="580" y="556">Loki 3 + Promtail</text>
+  <text class="s" x="580" y="574">journaux JSON, latence par pays</text>
+
+  <rect class="b" x="830" y="475" width="245" height="140" fill="#fef9c3" stroke="#a16207"/>
+  <text class="t" x="840" y="496">Grafana 11 (as code)</text>
+  <text class="s" x="840" y="515">dashboard « santé des pipelines »</text>
+  <text class="s" x="840" y="531">3 alertes : job fraude &gt; 5 min,</text>
+  <text class="s" x="840" y="546">lag AML &gt; 5000, rapport J+1 06h</text>
+  <text class="s" x="840" y="562">(démontrées : déclenchement</text>
+  <text class="s" x="840" y="578">puis résolution)</text>
+
+  <!-- Flows -->
+  <path class="l" d="M245,100 L290,100"/>
+  <text class="lab" x="250" y="93">CSV</text>
+  <path class="lb" d="M390,125 L390,145"/>
+  <path class="lr" d="M300,125 C 270,160 200,170 135,215"/>
+  <path class="lr" d="M135,265 L135,300"/>
+  <path class="lr" d="M245,350 C 265,330 270,260 290,255"/>
+  <path class="lr" d="M290,270 C 265,300 265,365 245,370"/>
+  <text class="lab" x="247" y="292">topics</text>
+  <path class="lb" d="M730,170 L748,170 L748,335 L732,335"/>
+  <path class="lr" d="M650,285 L650,305"/>
+  <path class="l" d="M730,365 L758,365 L758,190 L773,190"/>
+  <path class="l" d="M135,400 L135,414 L766,414 L766,212 L773,212"/>
+  <text class="lab" x="420" y="404">Trino lit aussi les topics Kafka (requête Lambda)</text>
+  <path class="l" d="M925,225 L925,275"/>
+  <path class="l" d="M925,120 L925,145"/>
+  
+</svg>
