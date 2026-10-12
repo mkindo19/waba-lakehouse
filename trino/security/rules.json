@@ -1,0 +1,57 @@
+{
+  "catalogs": [
+    {"user": "trino", "allow": "all"},
+    {"group": "administrateurs", "allow": "all"},
+    {"user": "superset|openmetadata|prometheus", "allow": "read-only"},
+    {"group": "analystes_pays|conformite|lecteurs", "catalog": "iceberg|system", "allow": "read-only"}
+  ],
+  "schemas": [
+    {"user": "trino", "owner": true},
+    {"group": "administrateurs", "owner": true},
+    {"owner": false}
+  ],
+  "tables": [
+    {"user": "trino", "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]},
+    {"group": "administrateurs", "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]},
+    {"user": "superset|openmetadata|prometheus", "privileges": ["SELECT"]},
+    {"catalog": "system", "schema": "jdbc|metadata", "privileges": ["SELECT"]},
+    {
+      "group": "conformite",
+      "catalog": "iceberg",
+      "schema": "gold",
+      "table": "daily_transaction_volume|npl_ratio_by_country|loss_ratio_by_product|claims_processing_time|mobile_money_daily_flow|cross_border_transfers|regulatory_daily_report|rt_aml_events|rt_liquidity_alerts",
+      "privileges": ["SELECT"]
+    },
+    {
+      "group": "analystes_pays",
+      "catalog": "iceberg",
+      "schema": "silver",
+      "table": "customers|products|branches|accounts|bank_transactions|insurance_operations|mobile_money_payments|loan_repayments",
+      "privileges": ["SELECT"],
+      "filter": "contains(current_groups(), concat('pays_', country_code))"
+    },
+    {
+      "group": "analystes_pays",
+      "catalog": "iceberg",
+      "schema": "gold",
+      "privileges": ["SELECT"],
+      "filter": "contains(current_groups(), concat('pays_', country_code))"
+    },
+    {
+      "group": "lecteurs",
+      "catalog": "iceberg",
+      "schema": "gold",
+      "table": "daily_transaction_volume|customer_arpu_monthly|npl_ratio_by_country|loss_ratio_by_product|claims_processing_time|mobile_money_daily_flow|cross_border_transfers",
+      "privileges": ["SELECT"]
+    }
+  ],
+  "queries": [
+    {"user": "trino", "allow": ["execute", "view", "kill"]},
+    {"group": "administrateurs", "allow": ["execute", "view", "kill"]},
+    {"allow": ["execute"]}
+  ],
+  "system_information": [
+    {"user": "trino", "allow": ["read", "write"]},
+    {"allow": ["read"]}
+  ]
+}

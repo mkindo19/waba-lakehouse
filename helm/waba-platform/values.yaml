@@ -25,7 +25,8 @@ ingress:
     - {host: kafka-ui, component: kafkaUi, domain: ingestion, service: kafka-ui, port: 80}
     - {host: generator, component: generator, domain: ingestion, service: generator, port: 8501}
     - {host: nifi, component: nifi, domain: ingestion, service: nifi, port: 8080}
-    - {host: trino, component: trino, domain: serving, service: trino, port: 8080}
+    - {host: trino, component: trino, domain: serving, service: trino, port: 8080,
+       annotations: {nginx.ingress.kubernetes.io/proxy-buffer-size: 16k}}
     - {host: airflow, component: airflow, domain: processing, service: airflow-webserver, port: 8080}
     # Jetons et cookies OIDC volumineux : tampon d'en-têtes NGINX agrandi (sinon 502 « upstream sent too big header »)
     - {host: superset, component: superset, domain: serving, service: superset, port: 8088,
@@ -57,7 +58,7 @@ secretKeys:
                ICEBERG_CATALOG_DB_PASSWORD]
   serving: [WABA_S3_ACCESS_KEY, WABA_S3_SECRET_KEY,
             SUPERSET_SECRET_KEY, SUPERSET_DB_PASSWORD, SUPERSET_ADMIN_USER, SUPERSET_ADMIN_PASSWORD,
-            SUPERSET_OIDC_CLIENT_SECRET]
+            SUPERSET_OIDC_CLIENT_SECRET, TRINO_OIDC_CLIENT_SECRET, TRINO_SHARED_SECRET]
   governance: [OPENMETADATA_DB_PASSWORD, OPENMETADATA_ADMIN_PASSWORD, OPENMETADATA_FERNET_KEY,
                KEYCLOAK_ADMIN_PASSWORD, KEYCLOAK_DB_PASSWORD, KEYCLOAK_DEMO_PASSWORD,
                SUPERSET_OIDC_CLIENT_SECRET, TRINO_OIDC_CLIENT_SECRET]
@@ -130,6 +131,10 @@ trino:
   heap: 1536M
   queryMaxMemory: 1GB
   queryMaxMemoryPerNode: 768MB
+  # Comptes de service autorisés en HTTP interne sans Keycloak (cf. D34) : CLI kubectl exec (trino), Superset,
+  # OpenMetadata, Prometheus. Les utilisateurs passent par Keycloak (HTTPS, https://trino.localtest.me:8443).
+  serviceUsers: [trino, superset, openmetadata, prometheus]
+  sso: true                  # SSO Keycloak + règles d'accès (si keycloak.enabled) ; false = Trino ouvert comme avant
   resources:
     requests: {cpu: 250m, memory: 2Gi}
     limits: {memory: 2560Mi}

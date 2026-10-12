@@ -5,7 +5,7 @@ SPARK_SUBMIT := $(COMPOSE) exec -T spark-master /opt/spark/bin/spark-submit --ma
 DATASET ?= all
 COUNTRY ?=
 
-.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3 k8s-files k8s-secrets k8s-install k8s-status k8s-expose k8s-uninstall k8s-lint k8s-images k8s-referentials k8s-stream k8s-trino k8s-deps k8s-crds k8s-spark k8s-spark-logs k8s-generate k8s-dag k8s-dag-runs k8s-dags-on k8s-alert-test k8s-gold-peek k8s-deps-update k8s-start k8s-sso
+.PHONY: help env up down clean ps logs referentials generate ingest replay trino test lint bronze silver gold report test-spark airflow-ui up-streaming topics kafka-smoke nifi-deploy nifi-redeploy kafka-peek stream-logs dlq-test stream-reset stream2-logs alert-test gold-peek stream2-reset lambda check3 k8s-files k8s-secrets k8s-install k8s-status k8s-expose k8s-uninstall k8s-lint k8s-images k8s-referentials k8s-stream k8s-trino k8s-deps k8s-crds k8s-spark k8s-spark-logs k8s-generate k8s-dag k8s-dag-runs k8s-dags-on k8s-alert-test k8s-gold-peek k8s-deps-update k8s-start k8s-sso k8s-trino-sso
 
 help:                ## Liste des commandes
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -65,7 +65,7 @@ test-spark:          ## Tests des transformations Spark (nécessite Java + pyspa
 	cd spark && python -m pytest -q tests
 
 lint:                ## Vérification PEP 8 (ruff)
-	ruff check generator spark airflow superset governance keycloak
+	ruff check generator spark airflow superset governance keycloak scripts
 
 # ----------------------------------------------------------------------------- niveau 3 : streaming
 KAFKA_EXEC := $(COMPOSE) exec -T kafka /opt/kafka/bin
@@ -144,6 +144,7 @@ check3:              ## [N3] Contrôles du niveau 3 (latence, double sink, DLQ, 
 K8S_RELEASE := waba
 K8S_NS := processing
 K8S_HTTP_PORT ?= 8090
+K8S_HTTPS_PORT ?= 8443
 HELM_CHART := helm/waba-platform
 
 k8s-files:           ## [N4] Copie les scripts de infra/ dans le chart (Helm ne lit que les fichiers du chart)
@@ -153,6 +154,7 @@ k8s-files:           ## [N4] Copie les scripts de infra/ dans le chart (Helm ne 
 	@cp infra/kafka/create-topics.sh $(HELM_CHART)/files/kafka/create-topics.sh
 	@cp infra/nifi/deploy_flow.py $(HELM_CHART)/files/nifi/deploy_flow.py
 	@cp trino/kafka/*.json $(HELM_CHART)/files/trino-kafka/
+	@mkdir -p $(HELM_CHART)/files/trino-security && cp trino/security/rules.json $(HELM_CHART)/files/trino-security/
 	@rm -f $(HELM_CHART)/files/airflow-dags/*.py && cp airflow/dags/*.py $(HELM_CHART)/files/airflow-dags/
 	@cp superset/superset_config.py superset/dashboards/build_assets.py superset/dashboards/import_assets.py superset/dashboards/apply_security.py $(HELM_CHART)/files/superset/
 	@mkdir -p $(HELM_CHART)/files/keycloak && cp keycloak/waba-realm.json $(HELM_CHART)/files/keycloak/
@@ -253,8 +255,12 @@ DURATION ?= 90
 k8s-stream:          ## [N4] Flux continu de transactions (ROWS par lot, DURATION secondes)
 	kubectl exec -n ingestion deploy/generator -- python -m waba_gen stream --rows-per-tick $(ROWS) --min-interval 20 --max-interval 30 --duration $(DURATION)
 
-k8s-trino:           ## [N4] Client SQL Trino dans le cluster (catalogue iceberg)
+k8s-trino:           ## [N4] Client SQL Trino dans le cluster (catalogue iceberg, compte de service « trino »)
 	kubectl exec -it -n serving deploy/trino -- trino --catalog iceberg
+
+k8s-trino-sso:       ## [N4] Requêtes Trino avec un compte KEYCLOAK (HTTPS 8443, make k8s-expose lancé) : droits par rôle
+	@.venv/bin/python -c "import trino" 2>/dev/null || { rm -rf .venv && python3 -m venv .venv && .venv/bin/pip install -q "trino==0.340.0"; } || { echo "-> installer le module venv : apt install -y python3-venv (ou python3.12-venv)"; exit 1; }
+	.venv/bin/python scripts/trino_sso.py --port $(K8S_HTTPS_PORT)
 
 k8s-spark:           ## [N4] Applications Spark (SparkApplication) et leurs pods
 	@kubectl get sparkapplications -n processing
@@ -275,7 +281,8 @@ k8s-status:          ## [N4] Pods, volumes et URL de la plateforme
 
 k8s-expose:          ## [N4] Rend les interfaces accessibles depuis Windows : http://<ui>.localtest.me (laisser tourner)
 	@echo "Interfaces (port $(K8S_HTTP_PORT)) : kafka-ui, minio, generator, nifi/nifi, trino, airflow, superset, grafana, prometheus, openmetadata, keycloak  ->  http://<nom>.localtest.me:$(K8S_HTTP_PORT)   (Ctrl+C pour arrêter)"
-	kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller $(K8S_HTTP_PORT):80 --address 127.0.0.1
+	@echo "Trino avec SSO Keycloak (HTTPS, certificat auto-signé de l'Ingress) : https://trino.localtest.me:$(K8S_HTTPS_PORT)"
+	kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller $(K8S_HTTP_PORT):80 $(K8S_HTTPS_PORT):443 --address 127.0.0.1
 
 k8s-sso:             ## [N4] SSO Keycloak : URL, utilisateurs de démonstration et rôles (mot de passe : KEYCLOAK_DEMO_PASSWORD de .env)
 	@echo "Superset : http://superset.localtest.me:$(K8S_HTTP_PORT)  (bouton keycloak)   Console Keycloak : http://keycloak.localtest.me:$(K8S_HTTP_PORT)/admin (admin / KEYCLOAK_ADMIN_PASSWORD)"
@@ -284,6 +291,7 @@ k8s-sso:             ## [N4] SSO Keycloak : URL, utilisateurs de démonstration 
 	@echo "  analyste.sn   country_analyst SN  -> 3 dashboards, Sénégal uniquement"
 	@echo "  conformite    compliance_officer  -> D2 Risque & Conformité (tables gold réglementaires)"
 	@echo "  lecteur       viewer              -> D1 et D3 en lecture seule, aucune donnée individuelle"
+	@echo "Trino : https://trino.localtest.me:$(K8S_HTTPS_PORT)/ui/  ou  make k8s-trino-sso (requêtes SQL avec le compte Keycloak)"
 	@kubectl get pods -n governance -l app.kubernetes.io/name=keycloak -o wide --no-headers 2>/dev/null || true
 
 k8s-uninstall:       ## [N4] Désinstalle la plateforme (les volumes de données sont conservés)

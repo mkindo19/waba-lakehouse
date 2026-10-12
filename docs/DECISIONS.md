@@ -477,7 +477,7 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
   Trino / Kafka (configuration validée par le SDK). Trouvé en test : dépendance `cachetools` manquante du paquet
   `openmetadata-ingestion` 1.10.14 (ajoutée à l'image), politique de mot de passe d'OpenMetadata (générateur adapté).
 
-## D33 — Keycloak : SSO OIDC et 4 rôles (Superset ; Trino en 4f-2)
+## D33 — Keycloak : SSO OIDC et 4 rôles (Superset ; Trino : D34)
 - **Déploiement** (namespace `governance`) : Keycloak 26.4.7 (image officielle `quay.io/keycloak/keycloak`) et sa
   base PostgreSQL sur PVC (`keep`). URL publique `http://keycloak.localtest.me:8090` (console : `/admin`, compte
   `admin` / `KEYCLOAK_ADMIN_PASSWORD`). HTTP uniquement parce que la plateforme est locale ; en production :
@@ -515,7 +515,7 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
   (sécurité par défaut). Le filtre natif « Pays » des dashboards ne propose alors que son pays. Aucun rôle WABA n'a
   SQL Lab : les filtres RLS ne s'appliquent pas au SQL libre. Données sensibles (IBAN, numéros de compte, montants
   individuels de sinistres) : aucun jeu de données Superset ne les expose (agrégats gold, identifiants hachés ou
-  masqués en silver, cf. D3) ; l'accès direct aux tables passe par Trino (4f-2).
+  masqués en silver, cf. D3) ; l'accès direct aux tables passe par Trino (D34).
 - **Pièges évités** (vérifiés en test local) : derrière l'Ingress, `X-Forwarded-Port` vaut 80 (port interne du
   contrôleur NGINX) alors que le navigateur est sur 8090 : `PROXY_FIX_CONFIG` ignore ce port (`x_port: 0`), sinon
   l'URL de retour OIDC devient `:80` et Keycloak la refuse. Déconnexion : Superset renvoie vers la déconnexion
@@ -526,3 +526,45 @@ Chaque choix non trivial est noté ici au fil de l'eau : contexte, décision, al
   un navigateur (Playwright), rôles obtenus, dashboards visibles, pays renvoyés par l'API de données
   (`analyste.ci` -> CI seulement, `analyste.sn` -> SN, `conformite` -> D2 seul, `lecteur` -> D1/D3 sans
   exploration), ré-import du realm et `apply_security.py` rejoués (idempotence).
+
+## D34 — Trino : SSO Keycloak (OAuth2) et droits par groupe
+- **Authentification des personnes** : OAuth2 / OIDC avec le client Keycloak `trino` (interface web, CLI, JDBC,
+  client Python). Identité Trino = `preferred_username`, groupes = claim `groups` (groupe fonctionnel + `pays_XX`).
+  Trino n'accepte OAuth2 que sur une connexion **sécurisée** (sinon seul l'authentificateur « insecure » est
+  utilisé, et ses cookies `__Secure-*` sont refusés par le navigateur en HTTP — vérifié dans le code de Trino 458).
+  Le TLS est donc terminé par l'Ingress (certificat par défaut, auto-signé, du contrôleur NGINX) :
+  `https://trino.localtest.me:8443` (`make k8s-expose` relaie aussi 8443 -> 443). Trino, qui traite les en-têtes
+  `X-Forwarded-*`, voit la requête comme HTTPS (`X-Forwarded-Proto`) et construit l'URL de retour avec
+  `X-Forwarded-Host` (qui contient le port 8443 et prime sur `X-Forwarded-Port: 443` dans Jetty).
+- **URL publique / interne** (comme D33) : découverte OIDC désactivée ; page de connexion et émetteur = URL
+  publique de Keycloak, jetons et clés de signature = service interne.
+- **Comptes de service** (`trino` pour `make k8s-trino`, `superset`, `openmetadata`, `prometheus`) : HTTP interne
+  au cluster sans mot de passe, comme avant, mais **limité à ces noms** (`insecure.user-mapping.pattern`) : sans
+  Keycloak, impossible de se présenter comme `admin.groupe` ou `analyste.ci`. Production : mots de passe ou JWT
+  pour ces comptes, NetworkPolicy, port HTTP fermé.
+- **Autorisation** : contrôle d'accès par fichier (`trino/security/rules.json`, première règle applicable,
+  tout le reste refusé) :
+
+  | Groupe Keycloak | Catalogues | Tables | Lignes |
+  |---|---|---|---|
+  | administrateurs (group_admin) | tous (dont kafka) | toutes, lecture / écriture | toutes |
+  | analystes_pays (country_analyst) | iceberg | silver (8 tables métier) + gold | **son pays** : filtre `contains(current_groups(), concat('pays_', country_code))` |
+  | conformite (compliance_officer) | iceberg | gold **réglementaires** (étiquette `Reglementaire` dans OpenMetadata, 9 tables, dont `rt_aml_events`) | toutes |
+  | lecteurs (viewer) | iceberg | gold **agrégées** (7 tables) : ni silver (IBAN / n° de compte pseudonymisés, montants individuels de sinistres), ni `rt_*` (événements individuels), ni raw / bronze / kafka | toutes |
+
+  Le filtre pays est une seule règle quel que soit le nombre de pays (un analyste multi-pays = plusieurs groupes
+  `pays_XX`) ; sans groupe pays, l'analyste ne voit aucune ligne. Requêtes : chacun voit / arrête les siennes,
+  les administrateurs toutes.
+- **Démonstration** : `make k8s-trino-sso` (client Python officiel `trino`, venv `.venv`) affiche une URL à ouvrir
+  dans le navigateur, puis exécute les mêmes requêtes pour le compte connecté : identité, schémas visibles, pays
+  vus en silver, IBAN pseudonymisés, gold réglementaire, événements AML, topics Kafka — `[OK]` / `[REFUSÉ]` selon
+  le rôle. Interface web : `https://trino.localtest.me:8443/ui/` (connexion Keycloak).
+- **Validation** : configuration écrite d'après le code source de Trino 458 (Trino ne peut pas être lancé dans
+  l'environnement de préparation), puis vérifiée sur le cluster avec `make k8s-trino-sso` :
+  `analyste.ci` -> groupes `[pays_CI, analystes_pays]`, schémas gold + silver, transactions silver **CI seulement**
+  (26 614), IBAN masqués `CI94****…2080`, NPL CI seulement, AML autorisé, Kafka refusé ; `lecteur` -> gold seul,
+  silver / `rt_aml_events` / Kafka refusés, NPL 8 pays ; `--user analyste.ci` en HTTP sans Keycloak refusé
+  (« No user mapping patterns match the principal ») ; interface web : connexion Keycloak puis bouton Log Out.
+  Trouvé à l'usage : le client Python `trino` n'attend la connexion que ~50 s (5 tentatives) -> porté à ~10 min dans
+  le script. Le `groups-field` OAuth2 est préfixé `deprecated.` en 458 : il fonctionne ; à remplacer par un group
+  provider à la montée de version.

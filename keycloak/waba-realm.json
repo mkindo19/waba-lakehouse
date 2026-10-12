@@ -318,16 +318,16 @@
       "implicitFlowEnabled": false,
       "frontchannelLogout": true,
       "redirectUris": [
-        "http://trino.localtest.me:8090/oauth2/callback",
-        "http://trino.localtest.me:8090/ui/logout/logout.html"
+        "https://trino.localtest.me:8443/oauth2/callback",
+        "https://trino.localtest.me:8443/ui/logout/logout.html"
       ],
       "webOrigins": [
         "+"
       ],
-      "rootUrl": "http://trino.localtest.me:8090",
+      "rootUrl": "https://trino.localtest.me:8443",
       "baseUrl": "/",
       "attributes": {
-        "post.logout.redirect.uris": "http://trino.localtest.me:8090/*"
+        "post.logout.redirect.uris": "https://trino.localtest.me:8443/*"
       },
       "defaultClientScopes": [
         "basic",

@@ -13,12 +13,13 @@ import json
 from pathlib import Path
 
 COUNTRIES = ["CI", "SN", "ML", "BF", "GN", "TG", "BJ", "GH"]
-UI_PORT = 8090                       # port de make k8s-expose (cf. values.yaml ingress.port)
+UI_PORT = 8090                       # port HTTP de make k8s-expose (cf. values.yaml ingress.port)
+TLS_PORT = 8443                      # port HTTPS de make k8s-expose : Trino exige HTTPS pour OAuth2 (cf. D34)
 DOMAIN = "localtest.me"
 
 
-def url(host: str) -> str:
-    return f"http://{host}.{DOMAIN}:{UI_PORT}"
+def url(host: str, tls: bool = False) -> str:
+    return f"https://{host}.{DOMAIN}:{TLS_PORT}" if tls else f"http://{host}.{DOMAIN}:{UI_PORT}"
 
 
 # Les 4 rôles de l'énoncé (rôles de realm) ; un utilisateur les reçoit via son groupe fonctionnel.
@@ -78,7 +79,7 @@ def client(client_id: str, name: str, secret_var: str, redirects: list[str], bas
 
 
 def realm() -> dict:
-    superset, trino = url("superset"), url("trino")
+    superset, trino = url("superset"), url("trino", tls=True)
     return {
         "realm": "waba", "displayName": "WABA Group", "enabled": True,
         # HTTP accepté : plateforme locale (minikube). Production : "external" (HTTPS obligatoire hors réseau privé)

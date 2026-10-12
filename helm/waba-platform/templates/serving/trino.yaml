@@ -23,6 +23,12 @@ spec:
         - name: trino
           image: {{ .Values.trino.image }}
           env: {{- include "waba.s3Env" $ | nindent 12 }}
+            {{- if and .Values.keycloak.enabled .Values.trino.sso }}
+            - name: TRINO_OIDC_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: TRINO_OIDC_CLIENT_SECRET}}
+            - name: TRINO_SHARED_SECRET
+              valueFrom: {secretKeyRef: {name: waba-secrets, key: TRINO_SHARED_SECRET}}
+            {{- end }}
           ports:
             - {name: http, containerPort: 8080}
           # Readiness : le coordinateur a fini de démarrer (« starting: false »), script fourni par l'image
@@ -53,6 +59,10 @@ spec:
                     - {key: jvm.config, path: jvm.config}
                     - {key: iceberg.properties, path: catalog/iceberg.properties}
                     - {key: kafka.properties, path: catalog/kafka.properties}
+                    {{- if and .Values.keycloak.enabled .Values.trino.sso }}
+                    - {key: access-control.properties, path: access-control.properties}
+                    - {key: rules.json, path: rules.json}
+                    {{- end }}
               - configMap:
                   name: trino-kafka-topics
                   items:
