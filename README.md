@@ -1,5 +1,7 @@
 # WABA Group — Plateforme analytique financière multi-pays
 
+**Vidéo de démonstration (9 min 56)** : https://drive.google.com/file/d/1xikpvJc7VfGFx26W0fZisvlr9ZE8tTQg/view?usp=sharing
+
 Challenge Data Engineer Artefact : un Data Lakehouse batch + streaming pour un groupe fictif de banque-assurance
 (banque, assurance, mobile money, microfinance) présent dans 8 pays d'Afrique de l'Ouest (7 en zone UEMOA + Ghana).
 
